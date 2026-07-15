@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a96372f2d473ffd4721dc43a511610d151bed4c56f1c1ceb8539e5f48a9ff561 # shrinks to tx = Transaction { consumed_state_id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 82, 201, 45, 154, 88, 219, 119, 3, 92, 96, 119, 209, 100, 225, 226, 118], client_pk: [222, 216, 189, 48, 243, 49, 9, 20, 89, 55, 124, 230, 19, 47, 139, 198, 118, 101, 178, 89, 28, 215, 131, 73, 150, 140, 183, 54, 151, 181, 59, 228], sender_wallet_id: "jwdorza@test.com/e7f0a2f6", wallet_seq: 258154, receiver_wallet_id: "gwcp@test.com/dfdf8fa6", receiver_address: None, amount: 3217562, reference: "Vr1Wc  PQfZuE 9d XdhsqoI45  5TtCiW ", nonce: 9891338509841905430, epoch: 8416875262993550141, client_sig: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], owner_proof: None, scar_passcode: None, burn_target_tx_id: None, oracle_claim: None, required_k: 3, proof_type: 1, core_version: "Kyoto/2.11" }
