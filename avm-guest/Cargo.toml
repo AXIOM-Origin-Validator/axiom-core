@@ -1,0 +1,31 @@
+[package]
+name = "axiom-avm-guest"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["AXIOM Project"]
+description = "Standalone RISC-V guest for AVM interpreter (§31 compliant)"
+
+# This crate compiles to riscv32im-unknown-none-elf
+# Build with: cargo build --target riscv32im-unknown-none-elf --release
+
+[dependencies]
+# Core validation logic (no_std)
+axiom-core-logic = { path = "../logic", default-features = false }
+
+# Serialization (no_std, CBOR — no JSON anywhere in Core)
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+ciborium = { version = "0.2", default-features = false }
+
+# Provide custom getrandom backend for bare-metal RISC-V.
+# Core crypto crates (ed25519-dalek, fips204, fips205) transitively depend on getrandom
+# via rand_core. The guest only verifies — never generates keys — so getrandom is never
+# called at runtime. We register a panic stub to satisfy the linker.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+
+[profile.release]
+opt-level = "s"    # Optimize for size (smaller ELF = faster interpretation)
+lto = true
+
+[features]
+dev-mode = ["axiom-core-logic/dev-mode"]
