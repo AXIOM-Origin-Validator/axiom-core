@@ -1,0 +1,63 @@
+[package]
+name = "axiom-zk-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AXIOM zkVM Host - Proof generation and verification"
+
+[dependencies]
+# Use AVM types for inputs/outputs
+axiom-dmap-vm = { path = "../avm" }
+# Core logic — ZkpCheckpointOutputs type
+axiom-core-logic = { path = "../logic" }
+
+# Serialization and utilities
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+# CBOR — the guest reads PublicInputs/FactCargo as a self-describing CBOR frame
+# (matches the DMAP guest at core/avm-guest/src/main.rs:78). risc0's word-serde
+# is NON-self-describing and silently drops `#[serde(skip_serializing_if)]`
+# fields (e.g. WalletState.wallet_id), desyncing host writes from guest reads.
+ciborium = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+hex = { workspace = true, features = ["std"] }
+
+# RISC Zero zkVM (host side) - must match cargo-risczero version
+risc0-zkvm = { version = "3.0", default-features = false, optional = true }
+risc0-binfmt = { version = "3.0", optional = true }
+bincode = { version = "1.3", optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+axiom-test-utils = { path = "../test-utils" }
+axiom-core-logic = { path = "../logic" }
+fips204 = { workspace = true }
+blake3 = { workspace = true }
+
+[[bin]]
+name = "first-proof"
+required-features = ["prove"]
+
+[[bin]]
+name = "zkp-demo"
+required-features = ["prove"]
+
+[[bin]]
+name = "compute-image-id"
+required-features = ["verify"]
+
+[[bin]]
+name = "bake-elf"
+required-features = ["verify"]
+
+[[bin]]
+name = "prover-worker"
+required-features = ["prove"]
+
+[features]
+default = []
+# Lightweight verification (no prover, just receipt validation)
+verify = ["risc0-zkvm", "risc0-binfmt", "bincode"]
+# Enable real proving (requires significant resources, implies verify)
+prove = ["verify", "risc0-zkvm/prove"]

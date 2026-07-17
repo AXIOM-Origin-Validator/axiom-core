@@ -1,0 +1,88 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  AXIOM · CORE tuning registers          →  protocol_gen::*  (baked into the ELF)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Edit a value here, rebuild Core, and build.rs regenerates the Rust constants.
+#  CHANGING ANY VALUE ROTATES THE CoreID (new ELF = new worldline). Never edit a
+#  `const` in .rs — this file is the single source of truth.
+#
+#  FORMAT      key = value    # optional inline comment.  Values are LITERAL u64
+#              integers (the parser does no arithmetic); `_` digit separators ok.
+#  DEV/PROD    `foo` = production value; `foo_dev` = the value used in a
+#              `--features dev-mode` build. build.rs emits ONE constant FOO,
+#              cfg-selected. A key with NO `_dev` twin is identical in both builds.
+#  NOTE        `atoms_per_axc` + `minimum_tx_atoms` are consumed by the
+#              axiom-denomination crate (its build.rs reads this file); Core's
+#              codegen deliberately skips them so they have one owner.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# ── Fees (DEED) ────────────────────────────────────────────────────────────
+#  Nabla register (write) / query (read) cost, in atoms. The atom UNIT itself
+#  (ATOMS_PER_AXC) and the dust floor (DUST_LIMIT) are NOT here — they live in the
+#  denomination register: denomination/protocol_denomination.toml (read via
+#  axiom_denomination::*). denomination owns the unit; Core owns the fees.
+deed_write_fee = 1_000   # per Nabla registration
+deed_read_fee  = 100     # per Nabla query
+
+# ── Transaction limits (protocol policy) ───────────────────────────────────
+#  Dust floor: Core rejects a transaction whose amount is below this (anti-spam).
+#  A POLICY threshold, not a unit fact — enforced in validation, so it lives here
+#  (not in the denomination register). Exposed as MINIMUM_TX_ATOMS.
+minimum_tx_atoms = 500_000   # 0.00005 AXC
+
+# ── Genesis & authority ────────────────────────────────────────────────────
+#  lockup_seconds: genesis-validator wallets (listed in genesis_lockup_wallets.txt)
+#  cannot SEND until GENESIS_NEWS_ANCHOR + this many seconds. Empty list = off (dev).
+#  owner_proof_required_epoch: TXs with epoch >= this require auth_hash. 0 = always.
+lockup_seconds             = 94_608_000   # 3 years (3 * 365 * 86400)
+owner_proof_required_epoch = 0
+
+# ── DWP (Decentralized Wallet Protection) ──────────────────────────────────
+max_votes_per_case_per_tick = 1   # anti-grief: one vote per sender/case/tick
+
+# ── Tick unit (TARDIS) ─────────────────────────────────────────────────────
+#  The base second-count per tick that every window below projects through.
+#  ALSO defined in protocol_nabla.toml (nabla's own copy) — the two MUST agree.
+tick_interval_secs = 5
+
+# ── Hibernation & recovery windows (TARDIS ticks) ──────────────────────────
+#  HAL (YPX-020) and RECALL (YPX-022) both lock a wallet with a wallet-carried
+#  `hibernation_until`; they differ only in the window length. Dev windows are
+#  compressed so a full re-anchor→hibernate→complete cycle is smoke-able.
+hibernation_window            = 18_000   # HAL lock
+hibernation_window_dev        = 50       #   ~4 min
+recall_hibernation_window     = 720      # RECALL maturity
+recall_hibernation_window_dev = 20
+
+#  RECALL initiation window (YPX-022 §2.1): LOW = receiver's protected redeem
+#  window (recall opens only after it); HIGH = when the affordance closes.
+recall_init_window_low      = 18_000
+recall_init_window_low_dev  = 10
+recall_init_window_high     = 50_000
+recall_init_window_high_dev = 100_000
+
+#  Dev-WALLET override (standalone keys, no `_dev` twin → same in dev AND prod):
+#  an @axiom.internal wallet gets these SHORT windows even in a prod build, so
+#  recovery is testable without the full wait. GATED on the k-signed is_dev_class
+#  (= is_dev_wallet(sender)); a PUBLIC wallet always gets the full window above
+#  and can NEVER be shortened — this cannot touch real money.
+dev_wallet_hibernation_window        = 50
+dev_wallet_recall_hibernation_window = 60
+
+# ── Oracle distribution (YPX-012) ──────────────────────────────────────────
+#  Long-horizon (24–48h); candidates for a future `_dev` short variant.
+claim_interval_ticks     = 17_280   # ~24h @ 5s/tick
+oracle_maturity_ticks    = 34_560   # ~48h
+oracle_vbc_renewal_ticks = 17_280   # ~24h
+
+# ── Audit — peer-audit + pulse-audit (mixed ticks / seconds) ───────────────
+audit_trigger_rate          = 100      # ~1 in 100 TXs triggers an audit
+peer_audit_timeout_secs     = 600      # 10 min
+peer_audit_ban_ticks        = 17_280   # ~24h
+peer_audit_crash_delay_secs = 180      # 3 min
+pulse_audit_interval_secs   = 300      # 5 min
+
+# ── Ark CI staleness bands (YPX-010) ───────────────────────────────────────
+staleness_fresh_secs = 1_800    # 30 min
+staleness_warm_secs  = 18_000   # 5 h
+staleness_stale_secs = 43_200   # 12 h

@@ -1,0 +1,62 @@
+[package]
+name = "axiom-dmap-vm"
+version = "2.4.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["AXIOM Project"]
+description = "AXIOM Virtual Machine - executes core.bin validation logic"
+
+[dependencies]
+# Core validation logic
+axiom-core-logic = { path = "../logic", default-features = false }
+
+# Serialization for inputs/outputs (CBOR — no JSON in Core)
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+ciborium = { version = "0.2", default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }  # tests only
+
+# Cryptographic primitives for host functions
+tiny-keccak = { version = "2.0", default-features = false, features = ["sha3"] }
+blake3 = { version = "1.5", default-features = false }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
+
+# Memory-hard hashing for audit chain (YPX-009 §8.5 — contention detection)
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+
+# Encoding
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# no_std Mutex replacement (wasm browser + risc0 zkVM guest are single-threaded,
+# spin is trivially correct). Non-optional so any no_std build (wasm OR the
+# risc0 guest, which enables no crate features) gets the spin/core path.
+spin = { version = "0.9" }
+
+# Cranelift JIT — baseline translation of RISC-V to native code at load time.
+# Optional: when disabled, falls back to the interpreted FastCpu executor.
+# The ELF, DMAP proofs, and protocol are unaffected by the execution engine.
+cranelift-codegen = { version = "0.130", optional = true }
+cranelift-frontend = { version = "0.130", optional = true }
+cranelift-module = { version = "0.130", optional = true }
+cranelift-jit = { version = "0.130", optional = true }
+target-lexicon = { version = "0.13", optional = true }
+
+# Dilithium is optional (requires ml-dsa-65 feature)
+fips204 = { version = "0.4", default-features = false, features = ["ml-dsa-65"], optional = true }
+
+[dev-dependencies]
+# witness_profile example needs the integer-keyed CBOR codec
+axiom-core-ipc = { path = "../ipc" }
+serde_json = { version = "1.0" }
+
+[features]
+default = ["std", "dilithium", "riscv-interpreter", "cranelift-jit-backend"]
+std = ["serde/std", "serde_json/std", "blake3/std", "ed25519-dalek/std", "axiom-core-logic/std", "ciborium/std"]
+dilithium = ["fips204"]
+embedded-core = []  # Enable to embed core.bin at compile time
+riscv-interpreter = []  # Real RV32IM interpretation of axiom-core.elf (§31 compliant)
+pulse-gate = []  # Gate pulse calibration behind Lambda benchmark (production release only)
+disable-audit = ["axiom-core-logic/dev-mode"]  # Disable YPX-009 audit + wallet key guard. NOT FOR PRODUCTION.
+dev-mode = ["axiom-core-logic/dev-mode"]  # Relaxed VBC requirements. NOT FOR PRODUCTION.
+light-audit = []    # Reduce Argon2id from 32MB to 512KB. Full chain logic, fast execution. For testing.
+cranelift-jit-backend = ["cranelift-codegen", "cranelift-frontend", "cranelift-module", "cranelift-jit", "target-lexicon"]  # Baseline JIT via Cranelift — 20-30x over interpreter
+wasm = ["riscv-interpreter"]  # Web wallet: WASM target, disable validator-only state (pulse, audit, peer-audit)

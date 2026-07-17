@@ -1,0 +1,14 @@
+[package]
+name = "axiom-zkvm-methods"
+version = "2.0.0"
+edition = "2021"
+license = "GPL-3.0"
+
+# This crate is NOT part of the main workspace
+# It requires separate RISC Zero build: ./build-zkvm.sh
+
+[build-dependencies]
+risc0-build = "3.0"
+
+[package.metadata.risc0]
+methods = ["guest"]

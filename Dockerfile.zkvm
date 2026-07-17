@@ -1,0 +1,52 @@
+# AXIOM zkVM Guest — Reproducible Build
+#
+# Produces identical axiom-zkvm-core.elf + image-id.hex on any machine.
+# Yellow Paper §31: "Core compiles to RISC-V ELF once per release."
+#
+# Usage:
+#   docker build -f core/Dockerfile.zkvm -t axiom-zkvm .
+#   docker run --rm -v $PWD/artifacts:/out axiom-zkvm
+#
+# Output (in /out):
+#   axiom-zkvm-core.elf    — RISC-V guest binary
+#   image-id.hex    — SHA3-256 program digest (hex)
+
+FROM rust:1.82-bookworm AS builder
+
+# Deterministic build flags — no build-id, consistent hashing
+ENV RUSTFLAGS="-C link-arg=-Wl,--hash-style=gnu -C link-arg=-Wl,--build-id=none"
+ENV CARGO_INCREMENTAL=0
+
+# Install RISC Zero toolchain
+RUN curl -L https://risczero.com/install | bash && \
+    /root/.risc0/bin/rzup install
+
+ENV PATH="/root/.risc0/bin:/root/.cargo/bin:${PATH}"
+
+# Add RISC-V target
+RUN rustup target add riscv32im-unknown-none-elf
+
+WORKDIR /build
+
+# Copy only what's needed for the guest build
+COPY core/zkvm-guest/ core/zkvm-guest/
+COPY core/avm/ core/avm/
+COPY core/logic/ core/logic/
+
+# Build the guest (release, no dev mode)
+WORKDIR /build/core/zkvm-guest/guest
+RUN cargo risczero build --release 2>&1
+
+# Extract ELF and compute IMAGE_ID
+RUN mkdir -p /out && \
+    ELF=$(find /build -name "*.elf" -path "*/risc0*" -o -name "core-bin" -path "*/riscv32*" | head -1) && \
+    if [ -z "$ELF" ]; then \
+        ELF=$(find /build -name "*.img" -path "*/risc0*" | head -1); \
+    fi && \
+    cp "$ELF" /out/axiom-zkvm-core.elf && \
+    r0vm image-id /out/axiom-zkvm-core.elf > /out/image-id.hex 2>/dev/null || \
+    sha256sum /out/axiom-zkvm-core.elf | cut -d' ' -f1 > /out/image-id.hex
+
+# Final stage — just the artifacts
+FROM scratch
+COPY --from=builder /out/ /out/
