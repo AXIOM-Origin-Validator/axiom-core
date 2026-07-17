@@ -1,0 +1,79 @@
+[package]
+name = "axiom-core-logic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AXIOM Core.bin validation logic - compiles to eBPF bytecode"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["std"]
+ceremony = []   # Exposes signing functions for ceremony/NBC issuance tools
+dev-mode = []   # Bypasses G1 compile guard + enables dev stubs. NEVER in production.
+std = [
+    "blake3/std",
+    "ed25519-dalek/std",
+    "serde/std",
+    "base64/std",
+    "hex/std",
+    "axiom-errors/std",
+    "axiom-denomination/std",
+    # Transport-layer encryption (forward-direction UMP).  These are
+    # optional deps gated to `std` so the AVM-guest (no_std) build
+    # never pulls them in — CLAUDE.md §1 carves transport crypto out
+    # of the Core authority scope; see docs/AXIOM_DESIGN_PublicMailCarriers.md §3.
+    "dep:x25519-dalek",
+    "dep:chacha20poly1305",
+    "dep:sha2",
+    "dep:rand_core",
+]
+# For eBPF target - minimal dependencies
+ebpf = []
+# Reserved (was CORE_VERSION_BRANCH gate; now unused — kept for future feature flag use)
+zkvm-guest = []
+
+[dependencies]
+blake3 = { workspace = true }
+tiny-keccak = { workspace = true }
+ed25519-dalek = { workspace = true }
+fips204 = { workspace = true }
+fips205 = { workspace = true }
+serde = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+# Structured error responses — see AXIOM_YellowPaper_Errors.md.
+# Pulled in with default-features=false so the no_std AVM-guest build works.
+# Host builds enable the `std` feature via the workspace std feature above.
+axiom-errors = { workspace = true }
+# Used by Transaction::to_canonical_cbor_value — the single source of truth
+# for the SDK ↔ validator wire format. default-features = false keeps the
+# no_std AVM-guest build working (ciborium 0.2 supports both modes).
+ciborium = { workspace = true }
+# Carries 乖乖 (椰子口味) into the AVM-guest ELF via #[used] anchor.
+# default-features=false so the AVM-guest build does NOT pull chrono /
+# std into the RISC-V target; the host build re-enables std via
+# core-logic's own `std` feature (see `[features] std = [...]` above,
+# which lists `axiom-denomination/std`).
+#
+# Touching the art bytes rebuilds the ELF → new CoreID across the
+# network — that is the canary signal for the AXC/L$/atom conversion
+# lib's consolidation.
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0", default-features = false }
+
+# Transport encryption (host only — gated to the `std` feature).  These
+# are *optional* deps so the AVM-guest (no_std) build excludes them
+# entirely.  See src/transport_crypto.rs.
+x25519-dalek = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true, features = ["std"] }
+sha2 = { workspace = true, optional = true, features = ["std"] }
+rand_core = { workspace = true, optional = true, features = ["std", "getrandom"] }
+
+[dev-dependencies]
+rand = "0.8"
+axiom-test-utils = { path = "../test-utils" }
+proptest = "1.4"
+serde_json = "1"
+axiom-core-ipc = { path = "../ipc" }

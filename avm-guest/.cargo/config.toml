@@ -1,0 +1,8 @@
+[build]
+target = "riscv32im-unknown-none-elf"
+
+[target.riscv32im-unknown-none-elf]
+# --remap-path-prefix: strip the builder's home from compiler-embedded source
+# paths (file!() panic locations) so the ELF carries no operator username. Neutral,
+# deterministic prefix (Linux is the sole ELF builder; Mac bundles the committed ELF).
+rustflags = ["-C", "link-arg=-Tlink.x", "--remap-path-prefix=/home/builder=/build"]

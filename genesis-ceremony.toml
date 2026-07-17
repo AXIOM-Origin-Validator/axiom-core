@@ -1,0 +1,140 @@
+# ============================================================================
+# AXIOM Genesis Ceremony Configuration
+# ============================================================================
+#
+# Paths are relative to where the ceremony tool runs from (src/ workspace root).
+# install_genesis.sh handles running from the correct directory.
+#
+# wallet_email: Genesis wallet address uses this email.
+#   Format: "validator_alpha@axiom" → wallet_id = "validator_alpha@axiom/hex8"
+#   These are not real email addresses. Operators change delivery email
+#   after going online (DEED TX → -01 suffix → provide receiver_address).
+
+[ceremony]
+vbc_version = 9
+output_dir = "genesis-output"
+root_keys_dir = "root-keys"
+expires_years = 10
+# Path to Core's genesis.rs for auto-install of constants
+# Relative to where the ceremony runs (src/ workspace root)
+core_genesis_path = "core/logic/src/genesis.rs"
+
+[certificate_authority]
+name = "AXIOM Origin"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+
+[[validators]]
+name = "axiom-first-penguin-alpha"
+path = "genesis-validators/axiom-first-penguin-alpha"
+wallet_email = "validator_alpha@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Alpha"
+
+[[validators]]
+name = "axiom-first-penguin-beta"
+path = "genesis-validators/axiom-first-penguin-beta"
+wallet_email = "validator_beta@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Beta"
+
+[[validators]]
+name = "axiom-first-penguin-gamma"
+path = "genesis-validators/axiom-first-penguin-gamma"
+wallet_email = "validator_gamma@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Gamma"
+
+[[validators]]
+name = "axiom-first-penguin-delta"
+path = "genesis-validators/axiom-first-penguin-delta"
+wallet_email = "validator_delta@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Delta"
+
+[[validators]]
+name = "axiom-first-penguin-epsilon"
+path = "genesis-validators/axiom-first-penguin-epsilon"
+wallet_email = "validator_epsilon@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Epsilon"
+
+[[validators]]
+name = "axiom-first-penguin-zeta"
+path = "genesis-validators/axiom-first-penguin-zeta"
+wallet_email = "validator_zeta@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Zeta"
+
+[[validators]]
+name = "axiom-first-penguin-eta"
+path = "genesis-validators/axiom-first-penguin-eta"
+wallet_email = "validator_eta@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Eta"
+
+[[validators]]
+name = "axiom-first-penguin-theta"
+path = "genesis-validators/axiom-first-penguin-theta"
+wallet_email = "validator_theta@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Theta"
+
+[[validators]]
+name = "axiom-first-penguin-iota"
+path = "genesis-validators/axiom-first-penguin-iota"
+wallet_email = "validator_iota@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Iota"
+
+[[validators]]
+name = "axiom-first-penguin-kappa"
+path = "genesis-validators/axiom-first-penguin-kappa"
+wallet_email = "validator_kappa@axiom"
+pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
+notes = "Genesis Validator - Kappa"
+
+# ============================================================================
+# Nabla Genesis Nodes
+# ============================================================================
+# Nabla nodes get NBC (not VBC), keys only (no stake wallet).
+# wallet_email generates a wallet_id for future DEED fee collection.
+
+[[nabla_nodes]]
+name = "nabla-genesis-alpha"
+wallet_email = "nabla_alpha@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-beta"
+wallet_email = "nabla_beta@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-gamma"
+wallet_email = "nabla_gamma@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-delta"
+wallet_email = "nabla_delta@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-epsilon"
+wallet_email = "nabla_epsilon@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-zeta"
+wallet_email = "nabla_zeta@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-eta"
+wallet_email = "nabla_eta@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-theta"
+wallet_email = "nabla_theta@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-iota"
+wallet_email = "nabla_iota@axiom"
+
+[[nabla_nodes]]
+name = "nabla-genesis-kappa"
+wallet_email = "nabla_kappa@axiom"
