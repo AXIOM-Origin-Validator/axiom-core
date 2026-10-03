@@ -11,6 +11,7 @@ description = "AXIOM zkVM Host - Proof generation and verification"
 axiom-dmap-vm = { path = "../avm" }
 # Core logic — ZkpCheckpointOutputs type
 axiom-core-logic = { path = "../logic" }
+axiom-core-ipc = { path = "../ipc" }
 
 # Serialization and utilities
 serde = { workspace = true, features = ["std"] }
@@ -35,13 +36,15 @@ axiom-core-logic = { path = "../logic" }
 fips204 = { workspace = true }
 blake3 = { workspace = true }
 
-[[bin]]
-name = "first-proof"
-required-features = ["prove"]
-
-[[bin]]
-name = "zkp-demo"
-required-features = ["prove"]
+# DELETED 2026-09-01: `first-proof` and `zkp-demo`. Both called
+# `ZkvmProver::prove()`, which decodes the journal as `PublicOutputs` and
+# therefore always dies with "expected variant index 0 <= i < 3" on a real
+# receipt. They had not compiled for months (stale `Transaction` /
+# `PublicInputs` field sets) and were the reason `cargo test --workspace`
+# could not pass — a red workspace gate is how three stale test fixtures
+# survived unnoticed for two months (e68c3855).
+# The live proving path is `prove_checkpoint()` via the `prover-worker`
+# subprocess below. See docs/AXIOM_GUIDE_ZKVM.md.
 
 [[bin]]
 name = "compute-image-id"

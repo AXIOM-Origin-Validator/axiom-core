@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "axiom-core-logic"
-version = "3.3.0"
+version = "3.7.1"
 dependencies = [
  "axiom-denomination",
  "axiom-errors",
@@ -47,7 +47,7 @@ version = "0.1.0"
 
 [[package]]
 name = "axiom-errors"
-version = "3.3.0"
+version = "3.7.1"
 dependencies = [
  "ciborium",
  "serde",

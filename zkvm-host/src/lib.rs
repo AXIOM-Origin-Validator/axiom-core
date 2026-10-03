@@ -179,276 +179,21 @@ mod tests {
         assert_eq!(parsed.program_digest, receipt.program_digest);
     }
 
-    /// Baseline STARK: trivial inputs, no crypto inside guest.
-    /// Measures pure zkVM overhead (RISC-V execution + STARK generation).
-    /// Run: cargo test --release -p axiom-zk-vm --features prove --lib -- --ignored test_stark_baseline
-    #[test]
-    #[ignore]
-    fn test_stark_baseline() {
-        use axiom_dmap_vm::{PublicInputs, CoreLogicMode};
+    // DELETED 2026-09-01: `test_stark_baseline` and `test_stark_real_cl3`.
+    //
+    // Both drove `ZkvmProver::prove()`, which decodes the journal as
+    // `PublicOutputs` and therefore ALWAYS fails on a real receipt
+    // ("expected variant index 0 <= i < 3") — the defect CLAUDE.md and
+    // AXIOM_GUIDE_ZKVM.md both record. They were `#[ignore]`d, so they had
+    // never run; and their fixtures had gone stale (missing RECALL / OODS /
+    // FOB inputs), so they no longer COMPILED either. An ignored test of a
+    // function that cannot succeed is not coverage, it is a claim (RULE 3).
+    //
+    // They went with the `first-proof` / `zkp-demo` bins in the same commit.
+    // The live path keeps its benchmark: `test_stark_checkpoint` below drives
+    // `prove_checkpoint()` / `verify_checkpoint()`, which is what
+    // `prover-worker` and Lambda actually call.
 
-        let inputs = PublicInputs {
-            mode: CoreLogicMode::CL3,
-            transaction: axiom_dmap_vm::Transaction {
-                consumed_state_id: [0u8; 32],
-                client_pk: vec![0u8; 32],
-                sender_wallet_id: String::new(),
-                wallet_seq: 0,
-                receiver_wallet_id: String::new(),
-                receiver_address: None,
-                amount: 0,
-                reference: String::new(),
-                nonce: 0,
-                epoch: 0,
-                client_sig: vec![],
-                burn_target_tx_id: None,
-                owner_proof: None,
-                scar_passcode: None,
-                required_k: 0,
-                proof_type: 0,
-                oracle_claim: None,
-                core_version: String::new(),
-                kind: axiom_dmap_vm::TxKind::Normal,
-                core_id: [0u8; 32],
-            },
-            prev_receipts: vec![],
-            current_state: None,
-            vbc_bundle: None,
-            my_validator_pk: None,
-            overlapped_signatures: vec![],
-            cheque_bundle: None,
-            receiver_pk: None,
-            receiver_current_balance: None,
-            receiver_wallet_seq: None,
-            receiver_new_balance: None,
-            receiver_new_state_id: None,
-            receiver_current_hibernation: None,
-            group_member_index: None,
-            sender_fact_chain: None,
-            receiver_fact_chain: None,
-            my_dilithium_sk: None,
-            my_dilithium_pk: None,
-            my_validator_id: None,
-            fact_witness_sigs: vec![],
-            issuer_sphincs_sk: None,
-            cl1_execution_proof: None,
-            zkp_nonce: None,
-            audit_confirmation: None,
-            nonce_response: None,
-            audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
-            wallet_secret: None,
-            fanout_message: None,
-            candidate_balance: None,
-            nabla_stake_proof: None,
-            frozen_wallets: None,
-            console_current_cert: None,
-            console_new_cert: None,
-            console_selector_picks: None,
-            console_nominations: None,
-            txid_attestation: None,
-        cheque_claim_proof: None,
-            clara_attestation: None,
-            phase_out_payload: None,
-            phase_out_era_end_ticks: vec![],
-            phase_out_blocked_era_ids: vec![],
-            current_tick: 0,
-            local_core_id: [0u8; 32],
-            withdrawal_inputs: None,
-            max_fact_links: None,
-        
-        };
-
-        let mut prover = ZkvmProver::production()
-            .expect("zkVM artifacts must be available");
-        let verifier = ZkvmVerifier::production()
-            .expect("zkVM verifier must be available");
-
-        let start = std::time::Instant::now();
-        eprintln!("[baseline] Starting STARK proof (trivial inputs, no crypto)...");
-        let (outputs, receipt) = prover.prove(inputs)
-            .expect("STARK proof generation must succeed");
-        let prove_elapsed = start.elapsed();
-
-        let start = std::time::Instant::now();
-        let verified_outputs = verifier.verify(&receipt)
-            .expect("STARK verification must succeed");
-        let verify_elapsed = start.elapsed();
-
-        assert!(receipt.seal.len() > 1000, "STARK seal must be non-trivial");
-        assert_eq!(verified_outputs.result, outputs.result);
-
-        eprintln!("[baseline] prove={:.2?} verify={:.2?} seal={} bytes",
-            prove_elapsed, verify_elapsed, receipt.seal.len());
-        eprintln!("[baseline] result={:?} (expected Reject — trivial inputs)", outputs.result);
-    }
-
-    /// Real CL3 STARK: valid Ed25519 signature, real wallet state, real validation.
-    /// This is the actual production workload — Core verifies a real transaction inside zkVM.
-    /// Run: cargo test --release -p axiom-zk-vm --features prove --lib -- --ignored test_stark_real_cl3
-    #[test]
-    #[ignore]
-    fn test_stark_real_cl3() {
-        use axiom_dmap_vm::{PublicInputs, CoreLogicMode};
-        use axiom_test_utils::TestWallet;
-        use axiom_core_logic::ValidationResult;
-        use fips204::ml_dsa_65;
-        use fips204::traits::SerDes;
-
-        // Create real wallets with Ed25519 keypairs
-        let sender = TestWallet::generate("sender@test.com", 1_000_000_000);
-        let receiver = TestWallet::generate("receiver@test.com", 0);
-
-        // Generate Dilithium keypair for FACT signing (production requirement)
-        eprintln!("[real_cl3] Generating ML-DSA-65 keypair...");
-        let (dil_pk, dil_sk) = ml_dsa_65::try_keygen()
-            .expect("Dilithium keygen failed");
-        let dil_sk_bytes = dil_sk.into_bytes().to_vec();
-        let dil_pk_bytes = dil_pk.into_bytes().to_vec();
-        eprintln!("[real_cl3] Dilithium SK={} bytes, PK={} bytes",
-            dil_sk_bytes.len(), dil_pk_bytes.len());
-
-        // ZKP nonce for anti-replay binding
-        let zkp_nonce: [u8; 32] = {
-            let mut n = [0u8; 32];
-            n[0] = 0xBE; n[1] = 0xEF; // deterministic for benchmark
-            n
-        };
-
-        // Create and sign a real transaction
-        let tx = sender.create_transaction(
-            &receiver.address(),
-            50_000, // above dust limit
-            "benchmark payment",
-            1,
-        );
-
-        // Build CL3 inputs with real wallet state — FULL PRODUCTION INPUTS
-        let inputs = PublicInputs {
-            mode: CoreLogicMode::CL3,
-            transaction: tx.clone(),
-            prev_receipts: vec![], // First TX (seq=1, prev_seq=0)
-            current_state: Some(sender.wallet_state()),
-            vbc_bundle: None,
-            my_validator_pk: None,
-            overlapped_signatures: vec![],
-            cheque_bundle: None,
-            receiver_pk: None,
-            receiver_current_balance: None,
-            receiver_wallet_seq: None,
-            receiver_new_balance: None,
-            receiver_new_state_id: None,
-            receiver_current_hibernation: None,
-            group_member_index: None,
-            sender_fact_chain: None,
-            receiver_fact_chain: None,
-            my_dilithium_sk: Some(dil_sk_bytes),
-            my_dilithium_pk: Some(dil_pk_bytes),
-            my_validator_id: None,
-            fact_witness_sigs: vec![],
-            issuer_sphincs_sk: None,
-            cl1_execution_proof: None,
-            zkp_nonce: Some(zkp_nonce),
-            audit_confirmation: None,
-            nonce_response: None,
-            audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
-            wallet_secret: None,
-            fanout_message: None,
-            candidate_balance: None,
-            nabla_stake_proof: None,
-            frozen_wallets: None,
-            console_current_cert: None,
-            console_new_cert: None,
-            console_selector_picks: None,
-            console_nominations: None,
-            txid_attestation: None,
-        cheque_claim_proof: None,
-            clara_attestation: None,
-            phase_out_payload: None,
-            phase_out_era_end_ticks: vec![],
-            phase_out_blocked_era_ids: vec![],
-            current_tick: 0,
-            local_core_id: [0u8; 32],
-            withdrawal_inputs: None,
-            max_fact_links: None,
-        
-        };
-
-        // Verify inputs work natively first (sanity check before expensive STARK)
-        {
-            let native_result = axiom_core_logic::execute_core(inputs.clone());
-            eprintln!("[real_cl3] Native result: {:?}", native_result.result);
-            eprintln!("[real_cl3] Native produced_state_id: {:?}",
-                native_result.produced_state_id.map(hex::encode));
-            assert_eq!(native_result.result, ValidationResult::Accept,
-                "Transaction must be accepted natively before proving. \
-                 Rejection reason: {:?}", native_result.rejection_reason);
-        }
-
-        let mut prover = ZkvmProver::production()
-            .expect("zkVM artifacts must be available");
-        let verifier = ZkvmVerifier::production()
-            .expect("zkVM verifier must be available");
-
-        // Prove — full production: Ed25519 verify + Dilithium sign + ZKP nonce inside zkVM
-        let start = std::time::Instant::now();
-        eprintln!("[real_cl3] Starting STARK proof (full production: Ed25519 + Dilithium + ZKP nonce)...");
-        let (outputs, receipt) = prover.prove(inputs)
-            .expect("STARK proof generation must succeed");
-        let prove_elapsed = start.elapsed();
-        eprintln!("[real_cl3] Proof generated in {:.2?}, seal={} bytes",
-            prove_elapsed, receipt.seal.len());
-
-        // Must be Accept — not a trivial rejection
-        assert_eq!(outputs.result, ValidationResult::Accept,
-            "CL3 must Accept valid transaction inside zkVM");
-        assert!(outputs.produced_state_id.is_some(),
-            "Accepted TX must produce a state ID");
-        assert!(outputs.txid.is_some(),
-            "Accepted TX must produce a txid");
-        assert!(outputs.new_balance.is_some(),
-            "Accepted TX must produce new_balance");
-        assert!(outputs.fact_signature.is_some(),
-            "CL3 with Dilithium SK must produce fact_signature");
-        assert!(outputs.zkp_nonce_hash.is_some(),
-            "CL3 with zkp_nonce must produce zkp_nonce_hash");
-        eprintln!("[real_cl3] fact_signature: {} bytes",
-            outputs.fact_signature.as_ref().map(|s| s.len()).unwrap_or(0));
-
-        // Verify
-        let start = std::time::Instant::now();
-        let verified_outputs = verifier.verify(&receipt)
-            .expect("STARK verification must succeed");
-        let verify_elapsed = start.elapsed();
-
-        // Outputs must match
-        assert_eq!(verified_outputs.result, ValidationResult::Accept);
-        assert_eq!(verified_outputs.produced_state_id, outputs.produced_state_id);
-        assert_eq!(verified_outputs.txid, outputs.txid);
-        assert_eq!(verified_outputs.new_balance, outputs.new_balance);
-
-        // Receipt round-trip
-        let serialized = receipt.to_bytes();
-        let deserialized = ZkvmReceipt::from_bytes(&serialized).unwrap();
-        let verified_again = verifier.verify(&deserialized).unwrap();
-        assert_eq!(verified_again.result, ValidationResult::Accept);
-
-        eprintln!("═══════════════════════════════════════════════");
-        eprintln!("[real_cl3] STARK BENCHMARK — REAL CL3 TRANSACTION");
-        eprintln!("  prove:     {:.2?}", prove_elapsed);
-        eprintln!("  verify:    {:.2?}", verify_elapsed);
-        eprintln!("  seal:      {} bytes ({:.1} KB)", receipt.seal.len(), receipt.seal.len() as f64 / 1024.0);
-        eprintln!("  result:    {:?}", outputs.result);
-        eprintln!("  txid:      {}", outputs.txid.as_ref().map(hex::encode).unwrap_or_default());
-        eprintln!("  state_id:  {}", outputs.produced_state_id.map(hex::encode).unwrap_or_default());
-        eprintln!("  balance:   {} → {}", sender.balance, outputs.new_balance.unwrap_or(0));
-        eprintln!("═══════════════════════════════════════════════");
-    }
 
     /// Benchmark: Minimal ZK boundary (checkpoint mode)
     ///
@@ -497,10 +242,26 @@ mod tests {
 
         // Build full production inputs (with Dilithium key for FACT signing)
         let inputs = PublicInputs {
+            zkq_request: None,
+            fact_certificates: Vec::new(),
+            // §5.2.2b/c — added after this test last compiled; a plain CL3
+            // send is not a subsidy claim and holds no stake lock.
+            claimant_vbc: None,
+            receiver_current_wall_clock_lock: None,
+            receiver_current_emission_claimed_epoch: None,
+            receiver_current_stake_floor_until: None,
+            receiver_current_wallet_format: None,
             mode: CoreLogicMode::CL3,
             transaction: tx.clone(),
             prev_receipts: vec![],
             current_state: Some(sender.wallet_state()),
+            // Inputs added after this test last compiled; a plain CL3 send
+            // exercises none of them.
+            recall_attestation: None,
+            oods_attestation: None,
+            fob_claim_attestation: None,
+            receiver_witness: None,
+            receiver_signing_key: None,
             vbc_bundle: None,
             my_validator_pk: None,
             overlapped_signatures: vec![],
@@ -524,12 +285,8 @@ mod tests {
             audit_confirmation: None,
             nonce_response: None,
             audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
             wallet_secret: None,
             fanout_message: None,
-            candidate_balance: None,
             nabla_stake_proof: None,
             frozen_wallets: None,
             console_current_cert: None,
@@ -544,7 +301,6 @@ mod tests {
             phase_out_blocked_era_ids: vec![],
             current_tick: 0,
             local_core_id: [0u8; 32],
-            withdrawal_inputs: None,
             max_fact_links: None,
         
         };
@@ -576,12 +332,11 @@ mod tests {
             assert!(checkpoint.new_balance.is_some());
             assert!(checkpoint.fact_signature.is_some(),
                 "Checkpoint must carry FACT signature from native execution");
-            // zkp_nonce_hash and fact_commitment are computed by the caller (guest),
-            // not by the checkpoint function itself (to avoid BLAKE3 cycles in RISC-V).
+            // zkp_nonce_hash is computed by the caller (guest), not by the
+            // checkpoint function itself (to avoid BLAKE3 cycles in RISC-V).
+            // (No FACT commitment field exists any more — R35, 2026-09-28.)
             assert!(checkpoint.zkp_nonce_hash.is_none(),
                 "Checkpoint function should NOT compute zkp_nonce_hash (caller does it)");
-            assert!(checkpoint.fact_commitment.is_none(),
-                "Checkpoint function should NOT compute fact_commitment (caller does it)");
             eprintln!("[checkpoint] Native checkpoint sanity check passed");
         }
 
@@ -608,9 +363,12 @@ mod tests {
             "Must produce new_balance");
         assert!(checkpoint.zkp_nonce_hash.is_some(),
             "Must produce zkp_nonce_hash");
-        // FACT fields: txid + fact_commitment from STARK, fact_signature attached post-proving
+        // FACT fields: txid from STARK, fact_signature attached post-proving.
+        // No fact_commitment: the guest's unread hand-copied FACT hash and the
+        // field were DELETED (Fork Settlement §9b R35, 2026-09-28) — nothing
+        // consumed it (Lambda set None, differential_conformance excluded it)
+        // and it had drifted from `compute_fact_commitment`.
         assert!(checkpoint.txid.is_some(), "Must carry txid");
-        assert!(checkpoint.fact_commitment.is_some(), "Must carry FACT commitment");
         assert!(checkpoint.fact_signature.is_some(),
             "Must carry FACT signature (attached post-proving by host)");
         assert_ne!(checkpoint.input_hash, [0u8; 32],
@@ -635,22 +393,7 @@ mod tests {
                 "Guest zkp_nonce_hash must match BLAKE3(AXIOM_ZKP_NONCE || nonce)");
         }
 
-        // Cross-check: fact_commitment must match protocol computation (BLAKE3)
-        // This is exactly what compute_fact_commitment() produces.
-        // CL3 send TX has no cheque_bundle → sender_anchor = None.
-        {
-            let expected_fact = axiom_core_logic::compute::compute_fact_commitment(
-                &checkpoint.txid.unwrap(),
-                &tx.consumed_state_id,
-                &checkpoint.produced_state_id.unwrap(),
-                tx.amount,
-                None,
-                false,
-            );
-            assert_eq!(checkpoint.fact_commitment.unwrap(), expected_fact,
-                "Guest fact_commitment must match compute_fact_commitment()");
-        }
-        eprintln!("[checkpoint] Protocol hash cross-checks PASSED (zkp_nonce_hash + fact_commitment)");
+        eprintln!("[checkpoint] Protocol hash cross-check PASSED (zkp_nonce_hash)");
 
         // === Step 5: Verify the STARK ===
         let start = std::time::Instant::now();

@@ -26,12 +26,23 @@ OUTPUT_DIR="${HOME}/.axiom/zkvm"
 DEBUG_MODE=false
 LOCAL_BUILD=false
 DEV_MODE=false
-# When --dev is passed, enable axiom-core-logic/dev-mode so the build does NOT
-# trip the G1 mainnet-ceremony compile guard (WALLET_IDENTITY_KEY assert). This
-# produces a DEV-KEY zkVM, consistent with a dev env's dev Core — NEVER for
-# production (a real release must build against the ceremony key, no dev-mode).
+# axiom-core-logic/dev-mode is passed iff scripts/build_profile.py says the tree is
+# dev-keyed (KI#240 — see below); a dev tree cannot build release without it (the
+# G1 WALLET_IDENTITY_KEY compile guard), a ceremony-keyed tree must not get it.
 DEV_FEAT=""
+# ╔═ BOOTSTRAP SUBSIDY — REMOVE WHEN POOLS DRAIN ═══════════════╗
+# The zkVM guest is the OTHER compilation of core/logic. The subsidy changes
+# `compute_post_tx_balance`, which the ZK checkpoint independently computes —
+# so a feature enabled for the DMAP guest and not here makes the two VMs
+# disagree on a claim's new_balance. They must be built with the same set.
+# Mirrors AXIOM_EXTRA_CORE_FEATURES in scripts/build-core-elf.sh.
+# ╚═════════════════════════════════════════════════════════════╝
+EXTRA_CORE_FEAT=""
+if [ -n "${AXIOM_EXTRA_CORE_FEATURES:-}" ]; then
+    EXTRA_CORE_FEAT="--features axiom-core-logic/${AXIOM_EXTRA_CORE_FEATURES}"
+fi
 
+DEV_REQUESTED=false
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,14 +60,31 @@ for arg in "$@"; do
             LOCAL_BUILD=true
             ;;
         --dev|--dev-mode)
-            DEV_MODE=true
-            DEV_FEAT="--features axiom-core-logic/dev-mode"
+            DEV_REQUESTED=true
             ;;
         --check)
             # Will be handled in main
             ;;
     esac
 done
+
+# ╔═ KI#240 — DEV OR REAL IS THE ONE RULE'S, NOT THIS FLAG'S ════════╗
+# The zkVM guest is a THIRD compilation of core/logic beside the AVM guest and
+# the natives; all of them ask scripts/build_profile.py (WALLET_IDENTITY_KEY
+# dev-prefix test). `--dev` is now only a CLAIM checked against the rule: asking
+# for dev on a ceremony-keyed tree is exactly the split KI#240 shipped, so it is
+# refused rather than obeyed. Fail closed on an undecidable tree.
+# ╚═══════════════════════════════════════════════════════════════════╝
+PROFILE="$(python3 "$SCRIPT_DIR/../scripts/build_profile.py")"
+DEV_FEAT="$(python3 "$SCRIPT_DIR/../scripts/build_profile.py" --features axiom-zkvm-guest)"
+if [ "$PROFILE" = "dev" ]; then
+    DEV_MODE=true
+elif [ "$DEV_REQUESTED" = true ]; then
+    echo "ERROR: --dev on a ceremony-keyed tree (build_profile.py says 'real')." >&2
+    echo "       The AVM guest and every native build REAL here; a dev zkVM guest would" >&2
+    echo "       disagree with them on every register twin (KI#240). Drop --dev." >&2
+    exit 1
+fi
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
@@ -153,7 +181,7 @@ build_guest() {
         echo ""
 
         # Run with verbose output — getrandom_backend="custom" required for risc0-zkvm-platform
-        RUSTFLAGS='--cfg getrandom_backend="custom"' cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf $DEV_FEAT 2>&1 | tee /tmp/zkvm-build.log
+        RUSTFLAGS='--cfg getrandom_backend="custom"' cargo +risc0 build --release --target riscv32im-risc0-zkvm-elf $DEV_FEAT $EXTRA_CORE_FEAT 2>&1 | tee /tmp/zkvm-build.log
         BUILD_RESULT=${PIPESTATUS[0]}
         
         echo ""
@@ -368,6 +396,27 @@ install_artifacts() {
     # Write IMAGE_ID
     echo "$IMAGE_ID" > "$OUTPUT_DIR/image-id.hex"
     echo -e "${GREEN}✓ Installed image-id.hex${NC}"
+
+    # ── Committed expected identity (2026-08-02) ──
+    # The avm-guest ELF has core/artifacts/CORE_ID.txt as its committed
+    # identity, so verify_deploy can prove the DEPLOYED bytes are the
+    # intended ones. The zkVM guest had NO committed counterpart — its
+    # IMAGE_ID lived only here in the runtime dir, so nothing could
+    # distinguish "correct zkVM ELF" from "some other zkVM ELF"; the only
+    # signal was an mtime, which is how it silently drifted for a month
+    # (see KnownIssues, two-VM invariant). Mirror the CoreID discipline:
+    # write the expected IMAGE_ID into core/artifacts/ so a rebuild that
+    # changes identity shows up as a reviewable diff.
+    ZK_ID_FILE="$SCRIPT_DIR/artifacts/ZKVM_IMAGE_ID.txt"
+    if [ -f "$ZK_ID_FILE" ] && [ "$(tr -d '[:space:]' < "$ZK_ID_FILE")" != "$IMAGE_ID" ]; then
+        echo -e "${YELLOW}!${NC} IMAGE_ID CHANGED vs committed core/artifacts/ZKVM_IMAGE_ID.txt"
+        echo "    was: $(tr -d '[:space:]' < "$ZK_ID_FILE")"
+        echo "    now: $IMAGE_ID"
+        echo "    Commit the new value deliberately — it identifies the second"
+        echo "    compilation of core/logic (risc0 guest), NOT the CoreID."
+    fi
+    echo "$IMAGE_ID" > "$ZK_ID_FILE"
+    echo -e "${GREEN}✓ Recorded core/artifacts/ZKVM_IMAGE_ID.txt${NC}"
     echo -e "${GREEN}✓ IMAGE_ID: $IMAGE_ID${NC}"
 
     # Create README

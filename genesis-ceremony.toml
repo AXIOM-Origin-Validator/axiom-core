@@ -6,9 +6,44 @@
 # install_genesis.sh handles running from the correct directory.
 #
 # wallet_email: Genesis wallet address uses this email.
-#   Format: "validator_alpha@axiom" → wallet_id = "validator_alpha@axiom/hex8"
-#   These are not real email addresses. Operators change delivery email
-#   after going online (DEED TX → -01 suffix → provide receiver_address).
+#   Format: "alpha@trustmesh.org" → wallet_id = "alpha@trustmesh.org/hex8"
+#   ⚠ RE-DOMAINED 2026-09-20 (the owner): dev/real class isolation makes @axiom a DEV
+#   label, so validators (and Nabla nodes) MUST use REAL domains — validators are
+#   real accounts, there is no dev VBC/NBC (AXIOM_DESIGN_FactClassIsolation.md
+#   preamble point 0). These moved validator_<name>@axiom / nabla_<name>@axiom →
+#   <name>@trustmesh.org (one real email per operator; stake + operational share
+#   it, differing only by pk_bind hex — the operator's own choice). This is a
+#   FRESH-GENESIS re-domaining: editing wallet_email is INTENTIONAL here (new ids
+#   + fresh keys + re-issued VBCs via the ceremony). Third-party operators use
+#   their own real email (gmail/yahoo/custom).
+#
+# operational_email (added 2026-09-09): the REAL mail account this validator
+#   operates from — the `<Short>_Operational` wallet's address and the account
+#   ANTIE's carriers log into.
+#   ⚠ wallet_email is ID-BOUND under a LIVE network: never edit it there — the
+#   genesis stake wallet ids and Core's compiled list derive from it. It is
+#   edited ONLY as part of a fresh-genesis re-domaining (as on 2026-09-20).
+#
+# wallet_id + stake_key_path (added 2026-09-20, the owner): genesis is NOT the public
+#   join path — the OPERATOR creates the stake wallet and the ceremony IMPORTS it
+#   (a validator never mints its own wallet). For the REAL ceremony, fill BOTH per
+#   validator:
+#     wallet_id      = the exact stake wallet_id you created, e.g.
+#                      "alpha@trustmesh.org/27dbb7d0ba". It is verified for its
+#                      key+email binding (email == wallet_email; trailing salt ==
+#                      BLAKE3(pk)[..2] of the imported key — the tool refuses a
+#                      mismatch). ⚠ It is NOT the id that bakes: the leading 8 hex
+#                      (checksum + pk_bind) are keyed by WALLET_IDENTITY_KEY, which
+#                      the ceremony mints AFTER you created the wallet, so the
+#                      network's own id is DERIVED under the new key and PRINTED at
+#                      the ceremony ("operator id … → baked id …"). Record the
+#                      printed id (2026-09-25 finding, AXIOM_OPS_GenesisReDomaining §5).
+#     stake_key_path = path to that wallet's Ed25519 PRIVATE key to import
+#                      (raw 32 bytes, i.e. a config/ed25519.key file, or 64-hex).
+#   REHEARSAL (g1-full-ceremony.sh --rehearsal): leave BOTH out and the tool mints
+#   a fresh key + derives the id on the spot. Setting one without the other is an
+#   error. So: the entries below (no wallet_id/stake_key_path) rehearse fine as-is;
+#   before the REAL run, add both lines to all 10 validators.
 
 [ceremony]
 vbc_version = 9
@@ -26,70 +61,84 @@ pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 [[validators]]
 name = "axiom-first-penguin-alpha"
 path = "genesis-validators/axiom-first-penguin-alpha"
-wallet_email = "validator_alpha@axiom"
+wallet_email = "alpha@trustmesh.org"
+operational_email = "alpha@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Alpha"
+# REAL ceremony — uncomment and fill (you create the wallet; ceremony imports it;
+# the id the network derives is printed at the ceremony — see the header):
+# wallet_id = "alpha@trustmesh.org/<hex10>"
+# stake_key_path = "genesis-validators/axiom-first-penguin-alpha/config/ed25519.key"
 
 [[validators]]
 name = "axiom-first-penguin-beta"
 path = "genesis-validators/axiom-first-penguin-beta"
-wallet_email = "validator_beta@axiom"
+wallet_email = "beta@trustmesh.org"
+operational_email = "beta@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Beta"
 
 [[validators]]
 name = "axiom-first-penguin-gamma"
 path = "genesis-validators/axiom-first-penguin-gamma"
-wallet_email = "validator_gamma@axiom"
+wallet_email = "gamma@trustmesh.org"
+operational_email = "gamma@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Gamma"
 
 [[validators]]
 name = "axiom-first-penguin-delta"
 path = "genesis-validators/axiom-first-penguin-delta"
-wallet_email = "validator_delta@axiom"
+wallet_email = "delta@trustmesh.org"
+operational_email = "delta@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Delta"
 
 [[validators]]
 name = "axiom-first-penguin-epsilon"
 path = "genesis-validators/axiom-first-penguin-epsilon"
-wallet_email = "validator_epsilon@axiom"
+wallet_email = "epsilon@trustmesh.org"
+operational_email = "epsilon@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Epsilon"
 
 [[validators]]
 name = "axiom-first-penguin-zeta"
 path = "genesis-validators/axiom-first-penguin-zeta"
-wallet_email = "validator_zeta@axiom"
+wallet_email = "zeta@trustmesh.org"
+operational_email = "zeta@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Zeta"
 
 [[validators]]
 name = "axiom-first-penguin-eta"
 path = "genesis-validators/axiom-first-penguin-eta"
-wallet_email = "validator_eta@axiom"
+wallet_email = "eta@trustmesh.org"
+operational_email = "eta@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Eta"
 
 [[validators]]
 name = "axiom-first-penguin-theta"
 path = "genesis-validators/axiom-first-penguin-theta"
-wallet_email = "validator_theta@axiom"
+wallet_email = "theta@trustmesh.org"
+operational_email = "theta@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Theta"
 
 [[validators]]
 name = "axiom-first-penguin-iota"
 path = "genesis-validators/axiom-first-penguin-iota"
-wallet_email = "validator_iota@axiom"
+wallet_email = "iota@trustmesh.org"
+operational_email = "iota@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Iota"
 
 [[validators]]
 name = "axiom-first-penguin-kappa"
 path = "genesis-validators/axiom-first-penguin-kappa"
-wallet_email = "validator_kappa@axiom"
+wallet_email = "kappa@trustmesh.org"
+operational_email = "kappa@trustmesh.org"
 pgp_fingerprint = "4A189E40F20F5A34B7D69F19D596AB0993DFF9D2"
 notes = "Genesis Validator - Kappa"
 
@@ -101,40 +150,40 @@ notes = "Genesis Validator - Kappa"
 
 [[nabla_nodes]]
 name = "nabla-genesis-alpha"
-wallet_email = "nabla_alpha@axiom"
+wallet_email = "alpha@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-beta"
-wallet_email = "nabla_beta@axiom"
+wallet_email = "beta@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-gamma"
-wallet_email = "nabla_gamma@axiom"
+wallet_email = "gamma@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-delta"
-wallet_email = "nabla_delta@axiom"
+wallet_email = "delta@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-epsilon"
-wallet_email = "nabla_epsilon@axiom"
+wallet_email = "epsilon@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-zeta"
-wallet_email = "nabla_zeta@axiom"
+wallet_email = "zeta@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-eta"
-wallet_email = "nabla_eta@axiom"
+wallet_email = "eta@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-theta"
-wallet_email = "nabla_theta@axiom"
+wallet_email = "theta@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-iota"
-wallet_email = "nabla_iota@axiom"
+wallet_email = "iota@trustmesh.org"
 
 [[nabla_nodes]]
 name = "nabla-genesis-kappa"
-wallet_email = "nabla_kappa@axiom"
+wallet_email = "kappa@trustmesh.org"

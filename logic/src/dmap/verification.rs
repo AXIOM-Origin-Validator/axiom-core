@@ -149,13 +149,13 @@ pub fn verify_dmap_attestation(
         return DmapResult::InvalidSignature;
     }
     let payload = attestation.signing_payload();
-    if axiom_core_logic::verify::verify_ed25519(
+    if crate::verify::verify_ed25519(
         expected_validator_pk,
         &payload,
         &attestation.signature,
     ).is_err() {
         // Try Dilithium for validator-produced attestations (larger sig)
-        if axiom_core_logic::verify::verify_dilithium(
+        if crate::verify::verify_dilithium(
             // Dilithium PK is not available here — Ed25519 is the expected path
             // for client/webclient attestations. For validator attestations,
             // the witness Ed25519 signature on commitment_hash already covers the proof.
@@ -297,7 +297,7 @@ mod tests {
     // reflects the real site behavior, not a replica.
     #[test]
     fn accept_set_composes_with_dmap_verify() {
-        use axiom_core_logic::version::resolve_dmap_verify_core_id_in;
+        use crate::version::resolve_dmap_verify_core_id_in;
         // Attestation minted under a PRIOR CoreID P; the node's CURRENT CoreID is Q ≠ P.
         let (att, prior_core_id, input_hash, output_hash, vpk) = make_test_attestation();
         let current = [0x11u8; 32];

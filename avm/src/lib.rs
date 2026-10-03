@@ -39,7 +39,7 @@ pub mod host_functions;
 pub mod core_handle;
 pub mod config;
 pub mod riscv;
-pub mod dmap;
+pub use axiom_core_logic::dmap;
 
 // Re-export core-logic types for convenience
 pub use axiom_core_logic::{
@@ -59,6 +59,8 @@ pub use axiom_core_logic::{
     execute_core,
 };
 
+#[cfg(feature = "std")]
+pub use interpreter::{self_audit_pulse, verify_self_audit_sample, SelfAuditPulse};
 pub use interpreter::{AvmInterpreter, AvmExecutionResult};
 pub use core_handle::{CoreHandle, CoreError};
 pub use config::AvmConfig;

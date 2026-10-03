@@ -19,17 +19,51 @@ use alloc::vec::Vec;
 
 // ── Constants ──
 
-/// Total AXC in the oracle reserve (= Market Allocation from White Paper §2.10).
+/// Total AXC the oracle may ever distribute — the OPEN share of the Market
+/// Allocation category, i.e. the `SubPoolId::Market` declaration in FACT #0.
 /// When exhausted, oracle stops permanently.
-pub const TOTAL_RESERVE: u64 = 88_000_000;
+///
+/// ⚠ This is NOT the whole 88,000,000 White Paper category. 2,500,000 of that
+/// category is carved into `SubPoolId::FoundationBootstrap` and is spent on
+/// Foundation validator stakes. If this constant were left at 88,000,000 the
+/// oracle could hand out the carved 2,500,000 a SECOND time — the reserve
+/// would over-distribute by exactly the carve. `oracle_reserve_matches_market_sub_pool`
+/// pins the two together.
+// ⚠ DERIVED FROM the Market sub-pool, not typed beside it. It was a literal
+// (85,500,000, then 85,473,000) and had to be hand-edited every time a
+// validator-join subsidy was carved out of Market — a second copy of a FACT #0
+// balance, which is exactly the drift RULE 1 exists to stop. KI#152 moved it
+// again (508 x 400 and 508,000 x 5 instead of 505-based), and that edit was
+// the third; there will not be a fourth.
+// `oracle_reserve_matches_market_sub_pool` still pins the two together, and
+// now cannot fail by construction — kept anyway, because it is the test that
+// documents WHY they are the same number.
+pub const TOTAL_RESERVE: u64 = crate::validation::protocol_gen::POOL_MARKET_AXC;
 
-/// Daily emission across all platforms (AXC/day).
-/// 88,000,000 / 3,650 days = 24,109 AXC/day (~10 year drain).
-pub const DAILY_EMISSION: u64 = 24_109;
+/// Daily emission across all platforms (AXC/day) — a ~10-year drain of the
+/// Market sub-pool.
+// ⚠ TIED TO `TOTAL_RESERVE` — `daily_emission_drains_reserve_in_about_ten_years`
+// asserts `DAILY_EMISSION * 3650 <= TOTAL_RESERVE`. Integer division floors,
+// so the schedule always promises slightly LESS than the reserve holds, which
+// is the safe direction; a literal here would eventually promise more.
+// History: 23,424 (85,500,000), then 23,417 (85,473,000) on 2026-09-04, briefly
+// 23,412 (85,456,800) on KI#152 (a) — reverted by (b) back to 23,417 — and
+// 24,144 (88,126,775) from the 2026-09-13 bootstrap-economics ruling.
+pub const DAILY_EMISSION: u64 = TOTAL_RESERVE / 3_650;
 
 /// Minimum interval between claims per user per platform (in ticks).
 /// 24 hours at 5-second ticks = 17,280 ticks.
-pub const CLAIM_INTERVAL_TICKS: u64 = crate::validation::protocol_gen::CLAIM_INTERVAL_TICKS;
+pub const CLAIM_INTERVAL_TICKS: crate::types::TickCount =
+    crate::types::TickCount(crate::validation::protocol_gen::CLAIM_INTERVAL_TICKS);
+/// Account-keyed dev twin (AXIOM_DESIGN_AccountKeyedDevTiming.md): a dev-class
+/// claimer's rate limit. Chosen at runtime via `claim_interval_ticks`, never a build.
+pub const CLAIM_INTERVAL_TICKS_DEV: crate::types::TickCount =
+    crate::types::TickCount(crate::validation::protocol_gen::CLAIM_INTERVAL_TICKS_DEV);
+
+/// The claim-interval for a claimer of the given class — the ONE selection site.
+pub fn claim_interval_ticks(is_dev_class: bool) -> crate::types::TickCount {
+    crate::types::dev_or_real(is_dev_class, CLAIM_INTERVAL_TICKS_DEV, CLAIM_INTERVAL_TICKS)
+}
 
 /// Number of whitelisted platforms.
 pub const PLATFORM_COUNT: usize = 11;
@@ -431,7 +465,7 @@ pub fn compute_axc_payout(credit_delta: u64, conversion_rate: u64) -> u64 {
 //   - sender == receiver (self-payout only, like Ark Rule 1)
 //   - k=5 minimum (via receiver address YPX-007 tier)
 //   - 48h cheque maturity (checked at CL5 redeem)
-//   - Payout cap: 5 AXC per claim (ORACLE_MAX_PAYOUT_PER_CLAIM)
+//   - Payout cap: 5 AXC per claim (ORACLE_MAX_PAYOUT_PER_CLAIM, atom-denominated)
 //   - 24h claim interval per binding
 // ════════════════════════════════════════════════════════════════════════
 
@@ -442,20 +476,45 @@ pub const ORACLE_K: usize = 5;
 pub const ORACLE_MIN_STAKE: u64 = 1_000_000;
 
 /// Oracle cheque maturity — 48h in 5-second ticks (must wait before redeem).
-pub const ORACLE_MATURITY_TICKS: u64 = crate::validation::protocol_gen::ORACLE_MATURITY_TICKS;
+pub const ORACLE_MATURITY_TICKS: crate::types::TickCount =
+    crate::types::TickCount(crate::validation::protocol_gen::ORACLE_MATURITY_TICKS);
+/// Account-keyed dev twin (AXIOM_DESIGN_AccountKeyedDevTiming.md): a dev-class oracle
+/// cheque matures faster. Chosen at runtime via `oracle_maturity_ticks`, never a build.
+pub const ORACLE_MATURITY_TICKS_DEV: crate::types::TickCount =
+    crate::types::TickCount(crate::validation::protocol_gen::ORACLE_MATURITY_TICKS_DEV);
 
-/// Recommended VBC renewal interval for oracle validators — 24 hours in ticks.
+/// The oracle-cheque maturity for a claimer of the given class — the ONE selection
+/// site. An oracle claim is a self-payout, so the acting wallet IS the claimer.
+pub fn oracle_maturity_ticks(is_dev_class: bool) -> crate::types::TickCount {
+    crate::types::dev_or_real(is_dev_class, ORACLE_MATURITY_TICKS_DEV, ORACLE_MATURITY_TICKS)
+}
+
+/// Recommended VBC renewal interval for oracle validators — 24 hours, in SECONDS.
 /// Operators enabling oracle processing should configure Lambda to auto-renew
 /// their VBC via CL8 on this schedule. This is an operator responsibility,
 /// not a Core-enforced rule — see protocol_core.toml [oracle] section.
-/// 17_280 ticks × 5 sec/tick = 86_400 sec = 24 hours.
+///
+/// KI#131: this is compared against a SECOND span (`tx.epoch - issued_at`), so it
+/// MUST be seconds. The old name `_TICKS` with a tick-COUNT value (17_280) enforced
+/// 17_280 seconds = 4.8h, not the documented 24h — a unit mix. It is now `_SECS`
+/// = 86_400 (24h). Name every duration register by its unit.
 /// Reference: YPX-012 §2.5, Yellow Paper §25.5.4
-pub const ORACLE_VBC_RENEWAL_TICKS: u64 = crate::validation::protocol_gen::ORACLE_VBC_RENEWAL_TICKS;
+pub const ORACLE_VBC_RENEWAL_SECS: u64 = crate::validation::protocol_gen::ORACLE_VBC_RENEWAL_SECS;
 
-/// Max AXC payout per claim.
+/// Max payout per claim, **in atoms** — 5 AXC.
+///
 /// SECURITY-ORACLE: Oracle payout cap — hard ceiling prevents oracle drain attacks.
 /// Both rates and cap are Core protocol constants (deterministic, stateless).
-pub const ORACLE_MAX_PAYOUT_PER_CLAIM: u64 = 5;
+///
+/// UNITS (drift audit D6, fixed 2026-07-28): this is compared at CL5 against
+/// `payout_amount`, which is credited straight into an **atom**-denominated
+/// balance. The literal `5` therefore meant 5 *atoms* — a 10^10 under-payment
+/// against the documented "5 AXC" (YPX-012 §24/§48/§137). Fail-safe (it
+/// under-credits, so no inflation), and the oracle ships disabled, which is why
+/// it stayed latent. Denominated through `axiom_denomination::axc()` so the unit
+/// is carried by the type-level helper rather than by a comment; Lambda's
+/// `compute_payout` returns atoms to match.
+pub const ORACLE_MAX_PAYOUT_PER_CLAIM: u64 = axiom_denomination::axc(5);
 
 /// Validate an oracle claim as a transaction.
 /// Called during CL1/CL2 validation when tx_type indicates oracle claim.
@@ -589,7 +648,13 @@ fn process_oracle_claim_inner(
 
     // 6. 24-hour interval (Task 63)
     // Skip for first claim (last_tick == 0)
-    if last_tick > 0 && claim.claim_tick < last_tick + CLAIM_INTERVAL_TICKS {
+    // KI#47: CLAIM_INTERVAL_TICKS is a tick COUNT; the tick fields are tick
+    // VALUES, so project via .to_secs(). Pre-fix the rate limit was ~5x
+    // weaker than designed (4.8h, not 24h).
+    // AXIOM_DESIGN_AccountKeyedDevTiming.md — account-keyed on the CLAIMER's class
+    // (is_dev_wallet(claim.wallet_id)); one binary serves a dev and a real claimer.
+    let interval = claim_interval_ticks(crate::wallet_id::is_dev_wallet(&claim.wallet_id));
+    if last_tick > 0 && claim.claim_tick < last_tick + interval.to_secs() {
         return Err(OracleError::ClaimTooSoon);
     }
 
@@ -746,8 +811,12 @@ mod tests {
     #[test]
     fn daily_pool_initial_allocation() {
         let pool = DailyPoolState::new("2027-03-15", TOTAL_RESERVE, 0);
-        // Folding@home: 10% of 24,109 = 2,410
-        assert_eq!(pool.pools[0], 2410);
+        // Folding@home carries WHITELIST[0].weight_pct of DAILY_EMISSION.
+        // Derived, not hardcoded — a literal here goes stale the moment the
+        // emission rate changes (it did, when the Foundation carve moved the
+        // reserve from 88,000,000 to 85,500,000).
+        let expected = DAILY_EMISSION * WHITELIST[0].weight_pct as u64 / 100;
+        assert_eq!(pool.pools[0], expected);
         // Total should approximate DAILY_EMISSION (rounding from integer division)
         let total: u64 = pool.pools.iter().sum();
         assert!(total <= DAILY_EMISSION);
@@ -785,11 +854,54 @@ mod tests {
 
         assert_eq!(&pool.date, "2027-03-16");
         assert_eq!(pool.claims_today, 0);
-        assert_eq!(pool.pools[0], 2410);
+        assert_eq!(pool.pools[0], DAILY_EMISSION * WHITELIST[0].weight_pct as u64 / 100);
         assert_eq!(pool.reserve_left, reserve_after);
     }
 
     // ── Reserve Counter Tests ──
+
+    /// The oracle's lifetime ceiling MUST equal the `Market` sub-pool it is
+    /// spending from. They are declared in two different files, so nothing but
+    /// this test stops them drifting — and a drift in the dangerous direction
+    /// (ceiling > sub-pool) is silent over-distribution, i.e. money creation.
+    ///
+    /// This is the coupling that the Foundation Bootstrap carve introduced:
+    /// the carve moved 2,500,000 out of `Market`, and the ceiling had to move
+    /// with it or the same coins could be spent twice — once as Foundation
+    /// stake, once through F2H.
+    #[test]
+    fn oracle_reserve_matches_market_sub_pool() {
+        use crate::genesis_integrity::{build_genesis_fact, SubPoolId};
+        let fact = build_genesis_fact(1);
+        let market = fact.sub_pools.iter()
+            .find(|p| p.pool_id == SubPoolId::Market)
+            .expect("Market sub-pool must exist")
+            .initial_balance;
+        assert_eq!(
+            TOTAL_RESERVE, market,
+            "oracle TOTAL_RESERVE ({TOTAL_RESERVE}) must equal the Market \
+             sub-pool ({market}); if the ceiling is higher the oracle can \
+             distribute coins the reserve does not hold",
+        );
+    }
+
+    /// Emission must drain the reserve in roughly the stated ten years and
+    /// must never exceed it — a rate set against a stale, larger reserve
+    /// would overshoot.
+    #[test]
+    fn daily_emission_drains_reserve_in_about_ten_years() {
+        const DAYS: u64 = 3_650;
+        assert!(
+            DAILY_EMISSION * DAYS <= TOTAL_RESERVE,
+            "emission {DAILY_EMISSION}/day over {DAYS} days exceeds the reserve {TOTAL_RESERVE}",
+        );
+        // Within 1% of a full drain, so the rate is not quietly stale.
+        let drained = DAILY_EMISSION * DAYS;
+        assert!(
+            drained * 100 >= TOTAL_RESERVE * 99,
+            "emission drains only {drained} of {TOTAL_RESERVE} in ten years — rate is stale",
+        );
+    }
 
     #[test]
     fn reserve_initial() {
@@ -881,7 +993,7 @@ mod tests {
         let c1 = make_claim("https://foldingathome.org", 1, addr, 50_000, 50_000, 100);
         process_oracle_claim_inner(&c1, &mut bindings, &mut pool, &mut reserve).unwrap();
 
-        let c2 = make_claim("https://foldingathome.org", 1, addr, 100_000, 50_000, 100 + CLAIM_INTERVAL_TICKS);
+        let c2 = make_claim("https://foldingathome.org", 1, addr, 100_000, 50_000, 100 + CLAIM_INTERVAL_TICKS.to_secs());
         let result = process_oracle_claim_inner(&c2, &mut bindings, &mut pool, &mut reserve).unwrap();
         assert_eq!(result.axc_awarded, 5);
         assert!(!result.new_binding);
@@ -976,7 +1088,7 @@ mod tests {
         let c1 = make_claim("https://foldingathome.org", 1, addr, 50_000, 50_000, 100);
         process_oracle_claim_inner(&c1, &mut bindings, &mut pool, &mut reserve).unwrap();
 
-        let c2 = make_claim("https://foldingathome.org", 1, addr, 100_000, 30_000, 100 + CLAIM_INTERVAL_TICKS);
+        let c2 = make_claim("https://foldingathome.org", 1, addr, 100_000, 30_000, 100 + CLAIM_INTERVAL_TICKS.to_secs());
         let result = process_oracle_claim_inner(&c2, &mut bindings, &mut pool, &mut reserve);
         assert_eq!(result.unwrap_err(), OracleError::DeltaMismatch);
     }
@@ -1089,9 +1201,28 @@ mod tests {
     fn oracle_constants_are_sane() {
         assert_eq!(ORACLE_K, 5);
         assert_eq!(ORACLE_MIN_STAKE, 1_000_000);
-        assert_eq!(ORACLE_MATURITY_TICKS, 34_560); // 48h at 5s/tick
-        assert_eq!(ORACLE_MAX_PAYOUT_PER_CLAIM, 5);
-        assert_eq!(ORACLE_VBC_RENEWAL_TICKS, 17_280); // 24h at 5s/tick
+        // AXIOM_DESIGN_AccountKeyedDevTiming.md — the maturity and the claim interval
+        // are ACCOUNT-KEYED: both values compiled in, chosen at runtime by class, on
+        // ONE binary. Assert the WIRING and the RELATIONSHIP, never the literal number —
+        // the numbers live in protocol_core.toml (`oracle_maturity_ticks[_dev]`,
+        // `claim_interval_ticks[_dev]`) and reach here as the generated constants; a
+        // test that re-typed 34_560/20 would just re-derive the toml (RULE 1).
+        assert_eq!(oracle_maturity_ticks(false).ticks(), ORACLE_MATURITY_TICKS.ticks());
+        assert_eq!(oracle_maturity_ticks(true).ticks(),  ORACLE_MATURITY_TICKS_DEV.ticks());
+        assert!(oracle_maturity_ticks(true).to_secs() < oracle_maturity_ticks(false).to_secs(),
+            "a dev claimer's oracle cheque matures sooner than a real claimer's");
+        assert_eq!(claim_interval_ticks(false).ticks(), CLAIM_INTERVAL_TICKS.ticks());
+        assert_eq!(claim_interval_ticks(true).ticks(),  CLAIM_INTERVAL_TICKS_DEV.ticks());
+        assert!(claim_interval_ticks(true).to_secs() < claim_interval_ticks(false).to_secs(),
+            "a dev claimer's rate limit is shorter than a real claimer's");
+        // KI#47: and it is now TYPED, so a raw compare against a tick VALUE
+        // span no longer compiles — see types::TickCount.
+        // 5 AXC expressed in atoms — the D6 unit fix. Asserting the raw
+        // literal `5` is what let the unit bug hide: it was true of an
+        // atom-denominated 5 as well.
+        assert_eq!(ORACLE_MAX_PAYOUT_PER_CLAIM, 50_000_000_000);
+        assert_eq!(ORACLE_MAX_PAYOUT_PER_CLAIM, axiom_denomination::axc(5));
+        assert_eq!(ORACLE_VBC_RENEWAL_SECS, 86_400); // KI#131: 24h in SECONDS (was 17_280 mislabelled _TICKS = 4.8h)
     }
 
 }

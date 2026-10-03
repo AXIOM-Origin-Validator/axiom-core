@@ -1,0 +1,72 @@
+# ============================================================================
+# AXIOM Genesis Fair-Launch Anchor — YPX-011 §2
+# ============================================================================
+#
+# PURPOSE (and its ONLY purpose): prove there is no pre-genesis money. On genesis
+# day the operator records the top headline from each of 7 state-backed news
+# organisations across 7 countries. Because the headlines cannot be known before
+# publication, and FACT #0 is signed over them, no AXC can have been minted before
+# genesis. This has NOTHING to do with the 3-year genesis stake lock — that counts
+# from GENESIS_STAKE_LOCK_START_SECS (set from the ceremony's launch-date prompt),
+# a separate constant (the owner, 2026-09-20: "the anchor is to ensure there is no
+# money from before; it has nothing to do with the lock time").
+#
+# The G1 ceremony READS this file, VERIFIES it is prepared, and bakes the headlines
+# + date into Core (genesis_integrity.rs: GENESIS_HEADLINES / GENESIS_DATE /
+# GENESIS_NEWS_ANCHOR) and into FACT #0 (Core-signed, stored in Nabla).
+#
+# REAL run — on genesis day:
+#   1. set `date` to the genesis day (UTC, YYYY-MM-DD),
+#   2. fill every `timestamp` + `headline` with the ACTUAL top story as published,
+#   3. set `placeholder = false`.
+# The ceremony REFUSES a real run while `placeholder = true`, any field is empty,
+# a "REPLACE" sentinel remains, or there are not exactly 7 entries.
+# Rehearsal: left as-is (placeholder) is fine — the ceremony mints anyway.
+#
+# The 7 canonical sources (YPX-011 §2.3) — all publicly funded / state-backed with
+# permanent archives; no single geopolitical event removes all seven at once:
+
+placeholder = true
+date = "2026-03-19"   # genesis day, UTC — all headlines must be published this day
+
+[[headlines]]
+country = "USA"
+organisation = "Associated Press (AP)"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"
+
+[[headlines]]
+country = "Japan"
+organisation = "NHK"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"
+
+[[headlines]]
+country = "UK"
+organisation = "BBC News"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"
+
+[[headlines]]
+country = "Taiwan"
+organisation = "Central News Agency (CNA)"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"
+
+[[headlines]]
+country = "Australia"
+organisation = "ABC Australia"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"
+
+[[headlines]]
+country = "Germany"
+organisation = "Deutsche Welle"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"
+
+[[headlines]]
+country = "France"
+organisation = "Le Monde"
+timestamp = "REPLACE — ISO-8601 timestamp as published"
+headline = "REPLACE — exact top headline text as published"

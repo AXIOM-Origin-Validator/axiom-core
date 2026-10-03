@@ -1,247 +1,204 @@
 # AXIOM Core Architecture
 
+> Historical note: an earlier revision of this file described an eBPF-based
+> core (`core.bin` bytecode + eBPF interpreter). That design was superseded;
+> the shipped core is an RV32IM RISC-V ELF. `artifacts/core.bin` is a dead
+> placeholder file from that era, not a build product.
+
 ## The Correct Model
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  zkVM (proof wrapper - RISC Zero)                           │
-│  - Proves execution happened                                │
-│  - Generates ZK proof                                       │
-│  - We trust this (like we trust SHA-256)                    │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  AVM (actual VM - eBPF interpreter)                   │  │
-│  │  - Interprets eBPF bytecode                           │  │
-│  │  - Executes core.bin                                  │  │
-│  │  - Can be rebuilt for any platform                    │  │
-│  │                                                       │  │
-│  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │  core.bin (eBPF bytecode)                       │  │  │
-│  │  │  - The actual validation logic                  │  │  │
-│  │  │  - NEVER changes                                │  │  │
-│  │  │  - ONE fingerprint forever                      │  │  │
-│  │  │  - Contains RISC0_FINGERPRINT for verification  │  │  │
-│  │  └─────────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────┐   ┌──────────────────────────────────┐
+│  DMAP-VM (axiom-dmap-vm)     │   │  zk-VM (axiom-zk-vm)             │
+│  core/avm — PRODUCTION path  │   │  core/zkvm-host — proof wrapper  │
+│  - RV32IM interpreter        │   │  - Wraps RISC Zero (risc0)       │
+│  - Cranelift JIT (perf layer │   │  - Runs the zkvm-guest build     │
+│    only, NOT attestation)    │   │  - Guest = MINIMAL CL3 ZK        │
+│  - Emits DMAP attestation    │   │    CHECKPOINT, a strict subset   │
+│    from the execution trace  │   │  - Not on any production hot     │
+│                              │   │    path today                    │
+│  ┌────────────────────────┐  │   │  ┌────────────────────────────┐  │
+│  │ axiom-core.elf (RV32IM)│  │   │  │ zkvm-guest ELF (risc0)     │  │
+│  │ - core/logic compiled  │  │   │  │ - core/logic compiled for  │  │
+│  │   by core/avm-guest    │  │   │  │   the risc0 target         │  │
+│  │ - CoreID = BLAKE3 of   │  │   │  │ - IMAGE_ID = risc0 image   │  │
+│  │   the committed ELF    │  │   │  │   id of this guest         │  │
+│  └────────────────────────┘  │   │  └────────────────────────────┘  │
+└──────────────────────────────┘   └──────────────────────────────────┘
 ```
+
+The validation logic lives ONCE, in `core/logic` (`axiom-core-logic`), and is
+compiled TWICE into two different guests. The two ELFs share a logic crate but
+are NOT the same binary and have independent identities (CoreID vs IMAGE_ID).
 
 ## Key Principles
 
-### 1. core.bin is IMMUTABLE
-- Fixed bytecode binary
-- ONE fingerprint forever
-- Contains hardcoded RISC0_FINGERPRINT to verify zkVM
-- If logic changes → new core.bin → new worldline
+### 1. axiom-core.elf is the identity artifact
+- `core/artifacts/axiom-core.elf`, built from `core/avm-guest`
+  (target `riscv32im-unknown-none-elf`)
+- **CoreID = BLAKE3 of the committed ELF** (never SHA-256); pinned in
+  `core/artifacts/CORE_ID.txt`, with the accept-set of prior worldlines in
+  `core/artifacts/BLESSED_PRIOR_CORE_IDS.txt`
+- If logic changes → new ELF → new CoreID → new worldline
+- The riscv build is NOT reproducible: verify a CoreID by hashing the
+  committed ELF, never by rebuilding
 
-### 2. AVM is PORTABLE
-- eBPF interpreter
-- Can be rebuilt for any platform
-- Can be reimplemented in any language
-- Simple bytecode format (~100 opcodes)
+### 2. The DMAP-VM is PORTABLE
+- RV32IM interpreter (`riscv-interpreter` feature) — the attestation-bearing
+  execution: the DMAP attestation is derived from the execution trace
+- Cranelift JIT (`cranelift-jit-backend`, on by default) is a PERFORMANCE
+  layer only (~20-30x over the interpreter); it never carries attestation,
+  and a JIT failure is alert-and-continue, not a validation outcome
+- Embedded in-process by the SDK (CL1), Lambda, and ANTIE
+  (`use_embedded_avm = true`)
 
-### 3. zkVM is for PROOFS
-- Not a real VM - a proof wrapper
-- Proves AVM executed core.bin correctly
-- We trust it like we trust cryptographic primitives
-- core.bin verifies RISC0_FINGERPRINT to detect corruption
+### 3. The zk-VM is for PROOFS, and proves a SUBSET
+- Wraps risc0; the live entry point is `prove_checkpoint()`
+  (`ZkvmProver::prove()` is dead code — wrong journal type)
+- The guest runs `execute_cl3_zkp_checkpoint` and commits
+  `ZkpCheckpointOutputs` — a strict subset: client authorization (Ed25519),
+  balance non-inflation, state-chain continuity, anti-replay, and a handful
+  of protocol rules
+- Dilithium FACT signing, FACT-chain verification, witness validation, txid
+  and commitment_hash run NATIVELY on the host, outside the ZK boundary
+- "Both VMs produce identical PublicOutputs" is architecturally impossible;
+  the real invariant is that the independently-computed checkpoint fields
+  (`result`, `produced_state_id`, `new_balance`, `new_wallet_seq`,
+  `rejection_reason`) agree with the DMAP-VM
 
 ### 4. Portability Model
 ```
-Platform X              Platform Y
-──────────────────      ──────────────────
-zkVM (x86)              zkVM (ARM)         ← Rebuild
-AVM (in zkVM guest)     AVM (in zkVM guest)← Same code, recompiled
-core.bin (eBPF)         core.bin (eBPF)    ← SAME BINARY
-
-IMAGE_ID = hash(zkVM guest) = hash(AVM + core.bin)
+Platform X                  Platform Y
+──────────────────────      ──────────────────────
+DMAP-VM (x86)               DMAP-VM (ARM)          ← Rebuild
+axiom-core.elf (RV32IM)     axiom-core.elf (RV32IM)← SAME BINARY, same CoreID
 ```
 
-If same zkVM version + same AVM + same core.bin → same IMAGE_ID
+The host VM is rebuilt per platform; the RV32IM ELF — and therefore the
+CoreID — is identical everywhere. The zk-VM side is independent: same zkvm
+guest → same IMAGE_ID.
 
 ## Project Structure
 
 ```
-axiom-core/
-│
-├── core-logic/                 # Validation logic source
-│   ├── src/
-│   │   ├── lib.rs              # Main logic
-│   │   ├── validation.rs       # Transaction validation
-│   │   ├── crypto.rs           # Signature verification  
-│   │   ├── types.rs            # Data structures
-│   │   └── ...
-│   ├── Cargo.toml
-│   └── build.rs                # Compiles to eBPF bytecode
-│
-├── core.bin                    # OUTPUT: eBPF bytecode artifact
-│                               # This is THE immutable artifact
-│
-├── avm/                        # eBPF interpreter
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── interpreter.rs      # eBPF VM implementation
-│   │   ├── memory.rs           # VM memory model
-│   │   └── helpers.rs          # Host functions (crypto, etc.)
-│   └── Cargo.toml
-│
-├── zkvm-guest/                 # RISC Zero guest program
-│   ├── src/
-│   │   └── main.rs             # Entry: load core.bin, run AVM
-│   ├── Cargo.toml
-│   └── core.bin                # Embedded copy of core.bin
-│
-├── zkvm-host/                  # RISC Zero host (prover/verifier)
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── prover.rs
-│   │   └── verifier.rs
-│   └── Cargo.toml
-│
-└── artifacts/                  # Published artifacts
-    ├── core.bin                # eBPF bytecode (for audit)
-    ├── guest.elf               # zkVM guest (for validators)
-    └── IMAGE_ID                # Canonical fingerprint
+core/
+├── logic/                  # Validation logic (crate: axiom-core-logic)
+│                           # The ONE source both guests compile
+├── avm/                    # DMAP-VM (crate: axiom-dmap-vm)
+│                           # RV32IM interpreter + Cranelift JIT
+├── avm-guest/              # Builds logic → artifacts/axiom-core.elf
+├── zkvm-guest/             # risc0 guest variant (CL3 ZK checkpoint)
+├── zkvm-host/              # zk-VM (crate: axiom-zk-vm), risc0 wrapper
+├── ipc/                    # CBOR-frame IPC codec (Core-as-subprocess path)
+├── bin/                    # axiom-core-bin — CBOR-IPC conformance host
+├── test-utils/             # Shared test helpers
+└── artifacts/              # Committed artifacts
+    ├── axiom-core.elf      # THE CoreID artifact
+    ├── CORE_ID.txt         # Canonical CoreID (BLAKE3 of the ELF)
+    ├── BLESSED_PRIOR_CORE_IDS.txt  # Accept-set of prior worldlines
+    └── ZKVM_IMAGE_ID.txt   # Committed risc0 IMAGE_ID counterpart
 ```
 
 ## Build Process
 
 ```
-Step 1: Get RISC Zero fingerprint
+Step 1: Build the DMAP guest (the CoreID artifact)
 ────────────────────────────────
-- Download RISC Zero v1.2.0 (pinned version)
-- Verify hash matches published fingerprint
-- RISC0_FINGERPRINT = 0xabc123...
+- cd core/avm-guest && cargo build --release
+    --target riscv32im-unknown-none-elf
+- Output: core/artifacts/axiom-core.elf
+- CoreID = BLAKE3(axiom-core.elf) → CORE_ID.txt
 
-Step 2: Build core.bin (eBPF bytecode)
+Step 2: Build the zkVM guest
 ────────────────────────────────
-- Write validation logic in Rust
-- Hardcode RISC0_FINGERPRINT in the logic
-- Compile to eBPF bytecode
-- Output: core.bin
-- CORE_FINGERPRINT = hash(core.bin) = 0xdef456...
+- core/build-zkvm.sh (risc0 toolchain)
+- IMAGE_ID recorded in core/artifacts/ZKVM_IMAGE_ID.txt
+- NOT rebuilt automatically — rebuild it whenever core/logic changes,
+  or the two compilations drift
 
-Step 3: Build AVM (eBPF interpreter)
+Step 3: Rotation
 ────────────────────────────────
-- eBPF interpreter in Rust (no_std)
-- Uses rbpf or custom implementation
-- Embeds core.bin bytecode
-
-Step 4: Build zkVM Guest
-────────────────────────────────
-- Contains AVM + embedded core.bin
-- Compile to RISC-V ELF
-- IMAGE_ID = hash(guest ELF)
-
-Step 5: Publish artifacts
-────────────────────────────────
-- core.bin (for audit/portability)
-- guest.elf (for validators)
-- IMAGE_ID (for verification)
+- Commit ELF + CORE_ID.txt + ZKVM_IMAGE_ID.txt +
+  BLESSED_PRIOR_CORE_IDS.txt together
+- Validators pin the canonical CoreID and accept blessed priors
 ```
 
 ## Runtime Flow
 
 ```
-1. Validator receives transaction
+Production (every validated transaction):
+1. SDK runs CL1 in its embedded DMAP-VM → DMAP execution proof
+2. Lambda rejects any request without a verified client Core proof
+3. Lambda re-runs Core (CL2/CL3/CL5) in its embedded DMAP-VM
+   against its own stored state
+4. Core takes PublicInputs, returns PublicOutputs — no disk,
+   no network, no other layers
 
-2. zkVM Host loads guest.elf
-   - Verifies IMAGE_ID matches canonical
-
-3. zkVM executes guest:
-   a. Guest loads core.bin (embedded)
-   b. Guest creates AVM (eBPF interpreter)
-   c. AVM verifies RISC0_FINGERPRINT
-   d. AVM executes core.bin with transaction
-   e. core.bin returns Accept/Reject
-   f. Guest commits result
-
-4. zkVM produces proof:
-   - proof.image_id = IMAGE_ID
-   - proof.result = Accept/Reject
-   - proof.zkp_data = cryptographic proof
-
-5. Verifier checks:
-   - proof.image_id == CANONICAL_IMAGE_ID?
-   - proof.zkp_data valid?
-   - Accept proof
+zk path (off the hot path):
+1. Host loads the zkvm guest, calls prove_checkpoint()
+2. Guest re-derives the checkpoint fields, commits ZkpCheckpointOutputs
+3. Verifier checks IMAGE_ID + the risc0 proof
+4. Differential harness (core/zkvm-host/examples/
+   differential_conformance.rs) asserts checkpoint ≡ DMAP-VM
 ```
 
 ## Verification
 
-```rust
-// In verifier
-const CANONICAL_IMAGE_ID: [u8; 32] = [0x...];
-
-fn verify_proof(proof: &Proof) -> bool {
-    // 1. Check IMAGE_ID matches canonical
-    if proof.image_id != CANONICAL_IMAGE_ID {
-        return false;
-    }
-    
-    // 2. Verify ZK proof cryptographically
-    if !risc0_verify(proof) {
-        return false;
-    }
-    
-    true
-}
-```
-
-```rust
-// Inside core.bin (eBPF)
-const RISC0_FINGERPRINT: [u8; 32] = [0x...];
-
-fn verify_runtime(actual_fingerprint: &[u8; 32]) -> bool {
-    actual_fingerprint == &RISC0_FINGERPRINT
-}
-```
+- **CoreID**: hash the committed ELF —
+  `cargo run -p axiom-core-logic --features dev-mode --example
+  compute_core_id -- core/artifacts/axiom-core.elf` — and compare against
+  `CORE_ID.txt`. Validators enforce the pin at runtime.
+- **IMAGE_ID**: risc0 verification ties a proof to the committed
+  `ZKVM_IMAGE_ID.txt`.
+- **Conformance**: `tests/run_conformance.py --core-bin` feeds the shared
+  vector corpus to any Core over CBOR IPC; `tools/conform` checks the
+  committed ELF against native `core/logic`.
 
 ## Security Model
 
 | Threat | Protection |
 |--------|------------|
-| Corrupted RISC Zero library | core.bin checks RISC0_FINGERPRINT |
-| Modified core.bin | IMAGE_ID changes, proofs rejected |
-| Modified AVM | IMAGE_ID changes, proofs rejected |
-| Bypassed execution | zkVM proof required, can't fake |
-| Different worldline | Different IMAGE_ID, can't mix |
+| Modified core logic | CoreID changes; validators reject the unpinned ELF |
+| Modified zkvm guest | IMAGE_ID changes, proofs rejected |
+| Bypassed client execution | Lambda requires a verified Core execution proof |
+| Two-compilation drift | differential conformance harness (checkpoint fields) |
+| Different worldline | different CoreID, admitted only via the blessed-prior set |
 
 ## 30-Year Portability
 
 ```
 Today (2026):
-- RISC Zero v1.2.0
-- AVM v1.0 (eBPF interpreter)
-- core.bin (eBPF bytecode)
+- risc0 (pinned) for the zk path
+- DMAP-VM interprets/JITs the RV32IM ELF
+- axiom-core.elf, one CoreID
 
-In 30 years (2056):
-- RISC Zero is dead
-- New zkVM exists (e.g., "FutureProof")
-- Rebuild AVM for FutureProof
-- core.bin (eBPF) UNCHANGED
-- New IMAGE_ID (because new zkVM)
-- New worldline, but same logic
+Later:
+- risc0 dead, some new zkVM exists
+- Rebuild the zk guest for it → new IMAGE_ID
+- Reimplement or rebuild the DMAP-VM host for new platforms
+- The RV32IM ELF — and its CoreID lineage — is the durable identity
 
 Audit process:
-1. Verify old core.bin hash matches historical record
-2. Verify new AVM correctly interprets eBPF
-3. New worldline inherits trust from old logic
+1. Verify the historical ELF hash (BLAKE3) matches the recorded CoreID
+2. Verify the new host correctly interprets RV32IM
+3. New worldline inherits trust from the old logic via the blessed-prior set
 ```
 
-## eBPF Choice Rationale
+## RISC-V Choice Rationale
 
-Why eBPF over other bytecode formats:
+Why RV32IM over other bytecode formats:
 
 | Format | Pros | Cons |
 |--------|------|------|
-| **eBPF** | Simple (~100 ops), well-documented, Linux kernel uses it | Less common outside Linux |
-| WASM | Very common, browsers support | More complex, larger spec |
-| RISC-V | Open standard, growing adoption | More complex than eBPF |
+| **RV32IM** | Open ISA, frozen base spec, rustc targets it directly, zkVMs speak it | Larger spec than eBPF |
+| eBPF | Simple (~100 ops) | No mainstream Rust core-target; would need a custom toolchain |
+| WASM | Very common | Larger spec, heavier runtime semantics |
 | Custom | Full control | No ecosystem, harder to audit |
 
-eBPF wins because:
-1. Simplest to reimplement
-2. Well-documented specification
-3. Easy to audit
-4. Linux kernel dependency ensures long-term documentation
+RV32IM wins because:
+1. `core/logic` compiles to it with the stock Rust toolchain — no custom
+   bytecode pipeline to trust
+2. The same logic recompiles for the risc0 guest, keeping the two-VM
+   differential meaningful
+3. Frozen, well-documented ISA; independent reimplementation of the
+   interpreter is tractable and auditable

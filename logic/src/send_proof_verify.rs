@@ -30,15 +30,11 @@ const MIN_WITNESSES: usize = 3;
 /// Recompute the `AXIOM_WITNESS_V2` commitment a validator signs. Byte-identical
 /// to the consensus commitment in `validation.rs` — the source of truth.
 fn witness_commitment(tx: &Transaction) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"AXIOM_WITNESS_V2");
-    h.update(&tx.consumed_state_id);
-    h.update(&tx.client_pk);
-    h.update(&tx.wallet_seq.to_le_bytes());
-    h.update(tx.receiver_wallet_id.as_bytes());
-    h.update(&tx.amount.to_le_bytes());
-    h.update(&tx.nonce.to_le_bytes());
-    *h.finalize().as_bytes()
+    // Pattern 1 sweep — ONE builder. This value is the k=3 witness
+    // commitment; the SDK re-derives it to verify a retained Send Proof and
+    // Lambda signs it. Three independent assemblies of one signed value is the
+    // KI#54 shape, so they all delegate to `validation::compute_commitment_hash`.
+    return crate::validation::compute_commitment_hash(tx);
 }
 
 /// Verify a retained Send Proof (signed transaction + finalized receipt) to
@@ -85,7 +81,9 @@ pub fn verify_send_proof_core(tx: &Transaction, receipt: &Receipt, now: u64) -> 
         // The decisive check: the signer must be a legitimate validator, proven
         // by a VBC that recursively verifies (SPHINCS+) back to ROOT_AUTHORITY_PKS.
         let bundle = ws.vbc_bundle.as_ref().ok_or(ValidationError::InvalidVBC)?;
-        crate::vbc::verify_vbc_bundle(bundle, now)?;
+        // §6b.5a — a witness bundle inside a receipt is past evidence: chain
+        // only, no stamp (ruled B, 2026-09-08).
+        crate::vbc::verify_vbc_bundle_historical(bundle, now)?;
         // Bind the signing key to the VBC subject — no key swap.
         if bundle.target_vbc.subject_pubkey_ed25519 != ws.validator_pk {
             return Err(ValidationError::InvalidVBC);
@@ -159,6 +157,8 @@ mod tests {
         let state_hash = [1u8; 32];
         let receipt = Receipt {
             oods_flag: None,
+            confidence_index: None,
+            sender_state: None,
             txid,
             state_hash,
             produced_state_id: [2u8; 32],
@@ -173,7 +173,7 @@ mod tests {
             fact_proof: None,
             required_k: 3,
             receipt_commitment: crate::compute::compute_receipt_commitment(
-                &txid, &state_hash, tx.wallet_seq, &commitment, tx.epoch, false, None,
+                &txid, &state_hash, tx.wallet_seq, &commitment, tx.epoch, false, None, None, None,
             ),
             fee_breakdown: Vec::new(),
             is_dev_class: false,

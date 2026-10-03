@@ -253,7 +253,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "axiom-core-logic"
-version = "3.2.3"
+version = "3.7.1"
 dependencies = [
  "axiom-denomination",
  "axiom-errors",
@@ -285,12 +285,11 @@ dependencies = [
  "serde",
  "serde_json",
  "spin",
- "tiny-keccak",
 ]
 
 [[package]]
 name = "axiom-errors"
-version = "3.2.3"
+version = "3.7.1"
 dependencies = [
  "ciborium",
  "serde",

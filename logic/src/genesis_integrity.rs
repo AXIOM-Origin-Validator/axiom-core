@@ -28,23 +28,39 @@ pub const GENESIS_POOL_TOTAL: u64 = 100_000_000;
 /// Dev-AXC supply held at FACT #0 by the `DevTreasury` pool. Separately
 /// denominated, outside the 100M public cap. Fixed lifetime — no minting
 /// authority (`AXIOM_DESIGN_FactClassIsolation.md` §4.4).
-pub const GENESIS_DEV_POOL_TOTAL: u64 = 1_000_000;
+pub const GENESIS_DEV_POOL_TOTAL: u64 =
+    crate::validation::protocol_gen::POOL_DEV_TREASURY_AXC;
 
 /// Genesis date (ISO-8601)
 pub const GENESIS_DATE: &str = "2026-03-19";
 
 /// Genesis news anchor — unix timestamp (seconds) of GENESIS_DATE midnight UTC.
 /// Derived from the 7 headline anchors: all 7 headlines were published on
-/// 2026-03-19 across 7 countries (USA, Japan, UK, Taiwan, Australia, Germany,
+/// GENESIS_DATE across 7 countries (USA, Japan, UK, Taiwan, Australia, Germany,
 /// France). Anyone can verify by looking up the headlines in public news archives.
-/// This timestamp is the provable "no earlier than" bound for genesis.
-/// Used as lockup start for genesis validator stakes (White Paper §2.10.1).
+/// This timestamp is the provable "no earlier than" bound for genesis — its SOLE
+/// purpose is proof-of-fair-launch: the headlines could not be known before
+/// genesis, so no pre-genesis AXC could exist (YPX-011 §2).
+///
+/// ⚠ It has NOTHING to do with lock timing (the owner, 2026-09-20): "the anchor is to
+/// ensure there is no money from before; it has nothing to do with the lock time."
+/// The 3-year genesis stake lock counts from GENESIS_STAKE_LOCK_START_SECS, a
+/// SEPARATE constant. Until 2026-09-20 the lock read THIS anchor, so changing the
+/// fair-launch proof would have silently shifted every genesis validator's unlock
+/// date. Decoupled — the two are independent now.
 pub const GENESIS_NEWS_ANCHOR: u64 = 1_773_878_400;
+
+/// Genesis stake lock start — unix timestamp (seconds), UTC midnight of the
+/// genesis LAUNCH day. The 3-year genesis validator stake lock counts from HERE
+/// (`validation.rs`), NOT from GENESIS_NEWS_ANCHOR. Set by the ceremony from the
+/// launch-date prompt. Decoupled from the news anchor 2026-09-20 (the owner): the
+/// anchor is proof-of-fair-launch only. Reference: White Paper §2.10.1.
+pub const GENESIS_STAKE_LOCK_START_SECS: u64 = 1_773_878_400;
 
 /// Sub-pool identifiers.
 ///
-/// The first seven variants are the public AXC pools that sum to
-/// `GENESIS_POOL_TOTAL` (100M). `DevTreasury` is the dev-AXC pool —
+/// Every variant except `DevTreasury` is a public AXC pool; together they
+/// sum to `GENESIS_POOL_TOTAL` (100M). `DevTreasury` is the dev-AXC pool —
 /// `GENESIS_DEV_POOL_TOTAL` (1M), separately denominated, outside the
 /// 100M cap (`AXIOM_DESIGN_FactClassIsolation.md` §4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,8 +69,30 @@ pub enum SubPoolId {
     Genesis,
     /// Sliding scale for early non-genesis validators
     Bootstrap,
-    /// Market allocation (F2H distribution)
+    /// Market allocation (F2H distribution).
+    ///
+    /// ⚠ Carved: the White Paper's "Market Allocation" CATEGORY is
+    /// 88,000,000 and is not changed. This declaration holds
+    /// 85,500,000 because `FoundationBootstrap` (2,500,000) is carved
+    /// out of that same category. The two together restore the WP
+    /// figure exactly. See the Yellow Paper genesis-allocation section.
     Market,
+    /// Foundation Bootstrap Reserve — funds the 5 bootstrap-selected
+    /// Foundation seats at `TIER2_CLAIM_AXC` each (a sized stimulus, ruled 2026-09-13 — not a floor)
+    /// (5 × 500,000 = 2,500,000). The other 5 Foundation slots are
+    /// earned and self-funded; Tier-3 (Community) grants come from
+    /// `Bootstrap`, not from here.
+    ///
+    /// Carved from the Market Allocation category so that the White
+    /// Paper's seven-category table and its 100,000,000 total both
+    /// stand unchanged (`AXIOM_DESIGN_MVIB_Stake.md` §tier table).
+    FoundationBootstrap,
+    /// Contribution emission pool — the opening balance of the ONE two-way
+    /// pool that pays validators and Nabla nodes per epoch and is topped up
+    /// from DEED by the shortfall (`AXIOM_DESIGN_ValidatorEmission.md`, YP
+    /// §25.2.4 v2.21.0). Carved from the Market Allocation category like
+    /// `FoundationBootstrap`; register `pool_validator_emission_axc`.
+    ValidatorEmission,
     /// 1 AXC per new wallet
     Airdrop,
     /// Developer recognition
@@ -123,6 +161,11 @@ pub fn compute_genesis_fact_hash(fact: &GenesisFact) -> [u8; 32] {
             SubPoolId::Architecture => 5,
             SubPoolId::SRP => 6,
             SubPoolId::DevTreasury => 7,
+            // Appended at 8 — ordinals are hash pre-image bytes, so existing
+            // variants keep their numbers. Never renumber.
+            SubPoolId::FoundationBootstrap => 8,
+            // Appended at 9 (2026-09-14). Never renumber.
+            SubPoolId::ValidatorEmission => 9,
         };
         hasher.update(&[ordinal]);
         hasher.update(&pool.initial_balance.to_le_bytes());
@@ -216,17 +259,28 @@ pub fn build_signed_genesis_fact(tick: u64, master_private_key: &[u8; 32]) -> Ge
 pub fn build_genesis_fact(tick: u64) -> GenesisFact {
     let sub_pools = vec![
         // ── Public AXC pools (sum to GENESIS_POOL_TOTAL = 100M) ─────
-        SubPoolDeclaration { pool_id: SubPoolId::Genesis, initial_balance: 10_000_000 },
-        SubPoolDeclaration { pool_id: SubPoolId::Airdrop, initial_balance: 600_000 },
-        SubPoolDeclaration { pool_id: SubPoolId::Bootstrap, initial_balance: 200_000 },
-        SubPoolDeclaration { pool_id: SubPoolId::SRP, initial_balance: 500_000 },
-        SubPoolDeclaration { pool_id: SubPoolId::Developer, initial_balance: 500_000 },
-        SubPoolDeclaration { pool_id: SubPoolId::Architecture, initial_balance: 200_000 },
-        SubPoolDeclaration { pool_id: SubPoolId::Market, initial_balance: 88_000_000 },
+        SubPoolDeclaration { pool_id: SubPoolId::Genesis, initial_balance: crate::validation::protocol_gen::POOL_GENESIS_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::Airdrop, initial_balance: crate::validation::protocol_gen::POOL_AIRDROP_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::Bootstrap, initial_balance: crate::validation::protocol_gen::POOL_BOOTSTRAP_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::SRP, initial_balance: crate::validation::protocol_gen::POOL_SRP_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::Developer, initial_balance: crate::validation::protocol_gen::POOL_DEVELOPER_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::Architecture, initial_balance: crate::validation::protocol_gen::POOL_ARCHITECTURE_AXC },
+        // Market Allocation category = 88,000,000 (White Paper, unchanged),
+        // carved into the open market share plus the Foundation reserve:
+        //     85,500,000 + 2,500,000 = 88,000,000
+        SubPoolDeclaration { pool_id: SubPoolId::Market, initial_balance: crate::validation::protocol_gen::POOL_MARKET_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::FoundationBootstrap, initial_balance: crate::validation::protocol_gen::POOL_FOUNDATION_BOOTSTRAP_AXC },
+        SubPoolDeclaration { pool_id: SubPoolId::ValidatorEmission, initial_balance: crate::validation::protocol_gen::POOL_VALIDATOR_EMISSION_AXC },
         // ── Dev-AXC treasury (1M, outside the 100M cap) ─────────────
         SubPoolDeclaration { pool_id: SubPoolId::DevTreasury, initial_balance: GENESIS_DEV_POOL_TOTAL },
     ];
 
+    // GENESIS_HEADLINES_BEGIN — the proof-of-fair-launch headlines (YPX-011 §2).
+    // ⚠ The G1 ceremony REWRITES this whole `let headlines = vec![…];` block from
+    // core/genesis-anchor.toml (the headlines prepared ON genesis day), between
+    // this marker and GENESIS_HEADLINES_END. The values below are the dev
+    // placeholder (2026-03-19); a real run refuses unless the anchor toml is
+    // prepared (g1-full-ceremony.sh preflight). Do not hand-edit for a real run.
     let headlines = vec![
         HeadlineAnchor {
             country: "USA".into(),
@@ -271,6 +325,7 @@ pub fn build_genesis_fact(tick: u64) -> GenesisFact {
             headline: "EN DIRECT, municipales 2026 : revivez le d\u{00e9}bat entre Emmanuel Gr\u{00e9}goire, Rachida Dati et Sophia Chikirou, les candidats au second tour \u{00e0} Paris".into(),
         },
     ];
+    // GENESIS_HEADLINES_END
 
     // Verify sub-pool sums per supply.
     let public_sum: u64 = sub_pools.iter()
@@ -307,6 +362,142 @@ mod tests {
             .map(|p| p.initial_balance)
             .sum();
         assert_eq!(public_sum, GENESIS_POOL_TOTAL);
+    }
+
+    /// The Foundation Bootstrap Reserve is CARVED from the Market Allocation
+    /// category, not added on top of it. The White Paper's seven-category
+    /// table and its 100,000,000 total are both unchanged, so this test pins
+    /// the two halves back to the WP figure: if anyone edits either number
+    /// without the other, the carve silently becomes a mint and this fails.
+    #[test]
+    fn foundation_reserve_is_carved_from_market_not_minted() {
+        // White Paper §2.10 table. The category SHRINKS every time the
+        // Community subsidy pool grows, because the Community pool is funded
+        // out of Market and — unlike FoundationBootstrap — is NOT part of this
+        // category, so it does not come back in the sum below. The
+        // 100,000,000 total is unchanged throughout.
+        //   88,000,000  original
+        //   87,998,000  2026-09-04: Community 200,000 -> 202,000 (400 x the
+        //               505 CLAIM, not the 500 floor — a claim pays its fee
+        //               out of the amount in transit)
+        //   87,996,800  2026-09-12, KI#152: the claim went 505 -> 508 so it
+        //               survives K_MAX witness slots, not just three, and
+        //               Community went 202,000 -> 203,200. FoundationBootstrap
+        //               also went 2,525,000 -> 2,540,000, but that stays
+        //               INSIDE the category, so only the 1,200 leaves.
+        //   88,157,075  2026-09-13 (ruled, YP §21.3 v2.20.0): 85 Community slots
+        //               (202,000 -> 42,925) and the Foundation claim 505,000 -> 6,060
+        //               (2,525,000 -> 30,300, INSIDE the category). The White Paper
+        //               TEXT keeps 87,998,000 by standing rule ("touch no genesis
+        //               whitepaper"); this pin is the category as the YP defines it.
+        const WP_MARKET_ALLOCATION: u64 = 88_157_075;
+        let fact = build_genesis_fact(1);
+        let bal = |id: SubPoolId| -> u64 {
+            fact.sub_pools.iter()
+                .find(|p| p.pool_id == id)
+                .unwrap_or_else(|| panic!("{id:?} pool must exist"))
+                .initial_balance
+        };
+        let market = bal(SubPoolId::Market);
+        let foundation = bal(SubPoolId::FoundationBootstrap);
+        let emission = bal(SubPoolId::ValidatorEmission);
+
+        assert_eq!(
+            market + foundation + emission,
+            WP_MARKET_ALLOCATION,
+            "Market ({market}) + FoundationBootstrap ({foundation}) + ValidatorEmission \
+             ({emission}) must restore the Market Allocation category exactly — \
+             otherwise a carve has become new money",
+        );
+        assert_eq!(emission, crate::validation::protocol_gen::POOL_VALIDATOR_EMISSION_AXC,
+            "the emission pool's opening balance is its register, nothing else");
+
+        // The reserve funds exactly the Foundation seats at the Foundation claim
+        // (a sized stimulus, ruled 2026-09-13 — Foundation is a title, not a tier).
+        assert_eq!(
+            foundation,
+            crate::types::FOUNDATION_SUBSIDISED_SLOTS * crate::types::TIER2_CLAIM_AXC,
+            "reserve must equal 5 x TIER2_CLAIM_AXC — it can fund the \
+             bootstrap-selected Foundation validators and no one else. NOTE the
+             CLAIM amount, not the floor: a claim pays the floor plus a fee \
+             allowance, so a reserve sized on the floor funds 5 claims minus \
+             the fees and strands the last one.",
+        );
+
+        // And the Community tier is funded from Bootstrap, NOT from here.
+        assert_eq!(bal(SubPoolId::Bootstrap), 42_925, "Community reserve = 85 x 505 (ruled 2026-09-13)");
+    }
+
+    /// Both validator-join subsidy pools must divide EXACTLY by their grant.
+    ///
+    /// A remainder is a silent conservation failure in one of two directions:
+    /// left over, it is supply nobody can ever spend; rounded up, it is a
+    /// grant the pool cannot fund. Neither shows up as an error at runtime —
+    /// the pool simply behaves differently from the declared supply — so the
+    /// arithmetic is asserted here rather than trusted to a comment.
+    ///
+    /// These numbers are frozen at G1: they are part of FACT #0, so changing
+    /// one afterwards changes the genesis fact hash and hence the CoreID.
+    #[test]
+    fn join_pools_drain_to_exactly_zero() {
+        use crate::types::{
+            COMMUNITY_SUBSIDISED_SLOTS, FOUNDATION_SUBSIDISED_SLOTS,
+            TIER2_CLAIM_AXC, TIER3_CLAIM_AXC,
+        };
+        let fact = build_genesis_fact(1);
+        let bal = |id: SubPoolId| -> u64 {
+            fact.sub_pools.iter()
+                .find(|p| p.pool_id == id)
+                .unwrap_or_else(|| panic!("{id:?} pool must exist"))
+                .initial_balance
+        };
+
+        // Foundation: 5 x 6,060 = 30,300
+        assert_eq!(
+            FOUNDATION_SUBSIDISED_SLOTS * TIER2_CLAIM_AXC,
+            bal(SubPoolId::FoundationBootstrap),
+            "Foundation slots x CLAIM must consume the reserve exactly",
+        );
+        // Community: 85 x 505 = 42,925
+        assert_eq!(
+            COMMUNITY_SUBSIDISED_SLOTS * TIER3_CLAIM_AXC,
+            bal(SubPoolId::Bootstrap),
+            "Community slots x CLAIM must consume the reserve exactly",
+        );
+
+        // State the remainder explicitly — an off-by-one in either direction
+        // is the failure this test exists to catch.
+        assert_eq!(bal(SubPoolId::FoundationBootstrap) % TIER2_CLAIM_AXC, 0);
+        assert_eq!(bal(SubPoolId::Bootstrap) % TIER3_CLAIM_AXC, 0);
+    }
+
+    /// The genesis validators' stakes must exactly consume the pool declared
+    /// for them. Unlike the subsidy pools, this one is never DRAINED by
+    /// grants — genesis stake is baked into each wallet's opening state
+    /// (`create_genesis_wallet`), so `SubPoolId::Genesis` is a conservation
+    /// declaration rather than a faucet. That makes this the only check that
+    /// the declaration still describes reality.
+    ///
+    /// Concretely: adding an 11th genesis validator without moving the
+    /// declaration would mint 1,000,000 AXC that the 100M cap never accounted
+    /// for, and nothing else in the codebase would notice.
+    #[test]
+    fn genesis_validator_stakes_match_declared_pool() {
+        use crate::genesis::GENESIS_VALIDATORS;
+        use crate::types::GENESIS_VALIDATOR_GRANT;
+        let fact = build_genesis_fact(1);
+        let declared = fact.sub_pools.iter()
+            .find(|p| p.pool_id == SubPoolId::Genesis)
+            .expect("Genesis sub-pool must exist")
+            .initial_balance;
+        assert_eq!(
+            GENESIS_VALIDATORS.len() as u64 * GENESIS_VALIDATOR_GRANT,
+            declared,
+            "{} genesis validators x {GENESIS_VALIDATOR_GRANT} must equal the declared \
+             Genesis pool ({declared}) — a validator added without moving the \
+             declaration mints supply the 100M cap never accounted for",
+            GENESIS_VALIDATORS.len(),
+        );
     }
 
     #[test]

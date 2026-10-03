@@ -132,7 +132,7 @@ impl AvmInterpreter {
             }
         }
 
-        let _host = HostFunctions::new(0, self.runtime_fingerprint);
+        let _host = HostFunctions::new();
         Ok(execute_core(inputs))
     }
 
@@ -151,7 +151,7 @@ impl AvmInterpreter {
             }
         }
 
-        let _host = HostFunctions::new(0, self.runtime_fingerprint);
+        let _host = HostFunctions::new();
         Ok(AvmExecutionResult {
             outputs: execute_core(inputs),
             dmap_trace: None,
@@ -184,7 +184,7 @@ impl AvmInterpreter {
                       t.elapsed(), input_cbor.len());
         }
 
-        let host = HostFunctions::new(0, self.runtime_fingerprint);
+        let host = HostFunctions::new();
 
         // Phase 1-3: use FastCpu with pre-decoded instruction cache.
         // Falls back to original Cpu if FastCpu encounters issues.
@@ -321,12 +321,49 @@ struct PendingAudit {
     /// Peer-audits get 100 TX countdown (email round-trip budget).
     /// Self-audits get 10 TX countdown (local resolution).
     is_peer: bool,
-    /// Wall-clock start time for peer-audit timeout (10 minutes).
-    /// Only used for peer-audits. Self-audits rely solely on TX countdown.
-    started_at: Option<std::time::Instant>,
+    /// The validated-tick watermark at DISPATCH (`mark_peer_audit_dispatched`).
+    /// B's response deadline is `PEER_AUDIT_TIMEOUT_TICKS` past this, measured
+    /// against `last_validated_tick` — a TICK count, never wall clock (§23.14.1
+    /// tick discipline; the `Instant`-based `PEER_AUDIT_TIMEOUT_SECS` arm was
+    /// retired 2026-09-24). Set at dispatch, not at arming: B has nothing to
+    /// answer until A has actually sent the request. Peer-audits only.
+    dispatched_at_tick: Option<u64>,
     /// The expected hash for peer-audit verification.
     /// Computed by Core from audit buffer, sent to remote, compared on return.
     peer_expected_hash: Option<[u8; 32]>,
+    /// §23.14 — whether Lambda has actually HANDED the peer-audit request to
+    /// the carrier (`mark_peer_audit_dispatched`). Peer-audits only.
+    ///
+    /// Until 2026-09-24 the AVM had no notion of this: the countdown and the
+    /// wall-clock deadline ran from the DEMAND, and at expiry the TARGET was
+    /// banned `NonResponds` whether or not a request had ever left this node.
+    /// Measured live (tier C, `ab98b539`): Lambda's target lookup could never
+    /// match (KI#207 — it keyed on the wrong hint column), so `0 sent` and
+    /// **32 innocent co-witnesses banned** in one run, each ban rejecting every
+    /// TX they witnessed for 24 h. That is the exact griefing the §23.14.1
+    /// silence ruling forbids: a ban must follow an ATTRIBUTABLE failure of B,
+    /// and a request A never sent is attributable only to A. So:
+    ///   - `dispatched == true`  → B's silence past the full budget → ban B.
+    ///   - `dispatched == false` → A did not initiate the audit Core demanded
+    ///     → §23.14 "if Lambda does not comply within a countdown window, the
+    ///     DMAP-VM terminates Core" — `AuditTimeout`, A's own penalty, never
+    ///     a ban of B.
+    /// Host-only state (like `remaining`): never written to `PublicOutputs`,
+    /// so re-executors see identical outputs — CoreID-neutral.
+    dispatched: bool,
+    /// SELF-audit only: the digest of the triggering execution, fixed at
+    /// arming. Lambda's confirmation (its DB record for `trigger_txid`) is
+    /// judged against THIS, never against a ring lookup.
+    ///
+    /// ⚠ WRONG READING, live until 2026-09-24: the self branch looked the
+    /// trigger up in the audit ring by `trigger_tx_number` — taken from
+    /// `tx_counter` BEFORE the tx was accumulated (the previous entry), and the
+    /// pulse audit clears the ring after every accepted tx — so a correct
+    /// confirmation could never verify after a reset ("TX not in buffer =
+    /// fail") and the countdown self-terminated. the owner 2026-09-24: "we should
+    /// get the self audit fixed" — this is the fix; `trigger_tx_number` is kept
+    /// for admin display only.
+    self_expected_digest: Option<axiom_core_logic::types::TxDigest>,
 }
 
 // ── YPX-009: Silicon Pulse — AVM-held audit state (validator-only) ──
@@ -339,8 +376,9 @@ struct PendingAudit {
 ///   TIME:  every 5 minutes (PULSE_AUDIT_INTERVAL_SECS), regardless of TX count.
 ///   COUNT: buffer reaches 80% of PULSE_BUFFER_MAX (prevents overflow).
 ///
-/// Argon2id uses 64MB per call — exceeds L3 cache, forces main memory access.
-/// Two validators on same machine = 128MB active → memory bus contention.
+/// Argon2id uses 32MB per call (m_cost = 32768, see `argon2id_hash`) — exceeds L3
+/// cache on commodity hardware, forcing main memory access. Two validators on one
+/// machine = 64MB active → memory bus contention.
 #[derive(Debug)]
 #[allow(dead_code)]
 struct AuditBuffer {
@@ -356,9 +394,64 @@ struct AuditBuffer {
     pending_request: Option<PulseAuditRequest>,
     /// Tick when pending request was issued (for deadline enforcement)
     pending_request_tick: Option<u64>,
-    /// Measured Argon2id(64MB,t=1) throughput on this hardware.
+    /// Measured Argon2id(32MB,t=1) throughput on this hardware.
     /// Reported in PulseProofData for peer validation.
     argon2id_per_sec: u64,
+}
+
+/// §23.14.6: the peer-audit ban window on the tick-stamp scale (seconds):
+/// `PEER_AUDIT_BAN_TICKS × TICK_INTERVAL_SECS` — 86 400 on a real build, 3 600
+/// on a `dev-mode` build. THE one source for both the expiry check and every
+/// message that states the duration.
+pub fn peer_audit_ban_window_secs() -> u64 {
+    axiom_core_logic::types::PEER_AUDIT_BAN_TICKS
+        .saturating_mul(axiom_core_logic::types::TICK_INTERVAL_SECS)
+}
+
+/// Human wording of the ban window for log lines and rejection text ("1 h",
+/// "24 h", "90 min"). Replaces a hardcoded "24 hours" that was wrong on every
+/// dev build (the dev ban is 1 h, `peer_audit_ban_ticks_dev`, 2026-09-26).
+pub fn peer_audit_ban_duration_text() -> String {
+    duration_text(peer_audit_ban_window_secs())
+}
+
+fn duration_text(secs: u64) -> String {
+    if secs >= 3600 && secs % 3600 == 0 {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 && secs % 60 == 0 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} s", secs)
+    }
+}
+
+/// §5.2.2e — an unsigned self-audit Pulse (see `AuditBuffer::self_audit_pulse`).
+/// The SDK / `validator-setup` sign it into a `PulseProofRequest`.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct SelfAuditPulse {
+    /// The Nabla-attested tick the chain was seeded with (part iii).
+    pub tick: u64,
+    pub epoch: u64,
+    pub full_accumulator: [u8; 32],
+    pub entry_count: u32,
+    pub sample_size: u32,
+    pub audit_hash: [u8; 32],
+    pub argon2id_per_sec: u64,
+}
+
+/// §5.2.2e — produce the candidacy self-audit for `validator_pk` (the stake
+/// wallet's key) at `epoch`, over `entries` synthetic digests.
+#[cfg(feature = "std")]
+pub fn self_audit_pulse(validator_pk: &[u8; 32], tick: u64, entries: u32) -> SelfAuditPulse {
+    AuditBuffer::self_audit_pulse(validator_pk, tick, entries)
+}
+
+/// §5.2.2e part iii — the issuers' native replay of a candidacy proof's
+/// Fiat-Shamir sample (see `AuditBuffer::verify_self_audit_sample`).
+#[cfg(feature = "std")]
+pub fn verify_self_audit_sample(validator_pk: &[u8; 32], tick: u64, entry_count: u32, sample_size: u32, full_accumulator: &[u8; 32], audit_hash: &[u8; 32]) -> Result<(), &'static str> {
+    AuditBuffer::verify_self_audit_sample(validator_pk, tick, entry_count, sample_size, full_accumulator, audit_hash)
 }
 
 #[cfg(feature = "std")]
@@ -378,7 +471,7 @@ impl AuditBuffer {
 
     /// Self-benchmark via Argon2id (YPX-009 §8.5).
     ///
-    /// Measures Argon2id(64MB,t=1) throughput for PULSE_CALIBRATION_MS.
+    /// Measures Argon2id(32MB,t=1) throughput for PULSE_CALIBRATION_MS.
     /// Reported in PulseProofData so peers can validate audit expectations.
     ///
     /// Argon2id is memory-hard: multiple validators sharing one machine
@@ -390,7 +483,7 @@ impl AuditBuffer {
         let mut hash = [0u8; 32];
         let mut count = 0u64;
 
-        // Always run at least 1 iteration — Argon2id(48MB) may exceed cal_ms in debug
+        // Always run at least 1 iteration — Argon2id(32MB) may exceed cal_ms in debug
         loop {
             hash = Self::argon2id_hash(&hash, &hash);
             count += 1;
@@ -523,12 +616,8 @@ impl AuditBuffer {
         let count = self.entries.len() as u32;
         let sample_size = (count as f64 * PULSE_SAMPLE_RATIO).ceil().max(1.0) as u32;
 
-        // Fiat-Shamir selection seed
-        let mut seed_input = Vec::with_capacity(18 + 32 + validator_pk.len());
-        seed_input.extend_from_slice(b"AXIOM_AUDIT_SELECT");
-        seed_input.extend_from_slice(&self.accumulator);
-        seed_input.extend_from_slice(validator_pk);
-        let seed = *blake3::hash(&seed_input).as_bytes();
+        // Fiat-Shamir selection seed — THE builder (KI#55 B2#2).
+        let seed = audit_select_seed(&self.accumulator, validator_pk);
 
         // Select indices using seed
         let selected_indices = fiat_shamir_select(&seed, count, sample_size);
@@ -556,28 +645,92 @@ impl AuditBuffer {
     /// Compute chain hash over a subset of entries (YPX-009 §4.3).
     /// Uses Argon2id → BLAKE3 same as accumulate() — Lambda must replay
     /// the memory-hard work to produce a matching hash.
+    /// KI#55 B2#2 (2026-10-02): the prover's chain IS the verifier's replay —
+    /// one loop (`replay_chain_from_raw`) over the selected entries, not a hand-
+    /// matched copy of it.
     fn compute_subset_hash(&self, indices: &[u32]) -> [u8; 32] {
-        let mut subset_acc = [0u8; 32];
-        for &idx in indices {
-            let digest = &self.entries[idx as usize];
-            let payload = Self::digest_payload(digest);
-
-            // Argon2id memory-hard work (same as accumulate)
-            let argon2_output = Self::argon2id_hash(&subset_acc, payload.as_bytes());
-
-            // BLAKE3 chain (verification domain tag)
-            let mut chain_input = Vec::with_capacity(18 + 32 + 32);
-            chain_input.extend_from_slice(b"AXIOM_AUDIT_VERIFY");
-            chain_input.extend_from_slice(&subset_acc);
-            chain_input.extend_from_slice(&argon2_output);
-            subset_acc = *blake3::hash(&chain_input).as_bytes();
-        }
-        subset_acc
+        let selected: Vec<TxDigest> = indices.iter()
+            .map(|&idx| self.entries[idx as usize].clone())
+            .collect();
+        Self::replay_chain_from_raw(&selected)
     }
 
     /// Replay Argon2id→BLAKE3 chain from raw TxDigest entries (self-audit verification).
     /// Same algorithm as compute_subset_hash, but operates on Lambda's raw DB data
     /// instead of buffer indices. Lambda does zero crypto — Core replays everything.
+    /// §5.2.2e — SELF-AUDIT. The candidacy Pulse a machine produces WITHOUT
+    /// any validation role (the owner, 2026-09-09: "never accept an uncertified
+    /// node taking part in validation"): the same Argon2id→BLAKE3 chain,
+    /// the same Fiat-Shamir request and the same replay a live audit uses,
+    /// run over `entries` synthetic digests derived from the candidate's own
+    /// key. The cost is real (entries × 32 MB Argon2id); the proof carries
+    /// the measured throughput. The caller signs the result with the key
+    /// (`pulse::pulse_proof_sign_payload`). `epoch` = the request's tick /
+    /// PULSE_EPOCH_LENGTH_TICKS.
+    /// `tick` = the Nabla-attested tick of the request round (part iii,
+    /// KI#142): entry `i` is `pulse::self_audit_entry_seed(pk, tick, i)`, so a
+    /// new round is a new chain and the work cannot be re-signed later.
+    pub fn self_audit_pulse(validator_pk: &[u8; 32], tick: u64, entries: u32) -> SelfAuditPulse {
+        let epoch = axiom_core_logic::pulse::pulse_epoch_of_tick(tick);
+        let mut buf = AuditBuffer::new();
+        buf.self_benchmark();
+        for i in 0..entries {
+            buf.accumulate(Self::self_audit_entry(validator_pk, tick, i));
+        }
+        let request = buf.generate_request(validator_pk, epoch);
+        let selected: Vec<TxDigest> = request.selected_indices.iter()
+            .map(|&i| buf.entries[i as usize].clone()).collect();
+        let audit_hash = Self::replay_chain_from_raw(&selected);
+        debug_assert_eq!(audit_hash, request.expected_hash, "self-audit replay must match its own request");
+        SelfAuditPulse {
+            tick,
+            epoch,
+            full_accumulator: buf.accumulator,
+            entry_count: entries,
+            sample_size: selected.len() as u32,
+            audit_hash,
+            argon2id_per_sec: buf.argon2id_per_sec,
+        }
+    }
+
+    /// The synthetic entry `i` of a self-audit — ONE derivation for the
+    /// producer above and the issuers' replay below.
+    fn self_audit_entry(validator_pk: &[u8; 32], tick: u64, i: u32) -> TxDigest {
+        TxDigest {
+            tx_number: i as u64 + 1,
+            sender_balance: 0,
+            receiver_balance: 0,
+            state_id: axiom_core_logic::pulse::self_audit_entry_seed(validator_pk, tick, i),
+            amount: 0,
+        }
+    }
+
+    /// §5.2.2e part iii — an ISSUER replays the Fiat-Shamir sample a candidacy
+    /// proof claims, natively, before Core signs. The selection is derived
+    /// from the proof itself (`AXIOM_AUDIT_SELECT` ‖ full_accumulator ‖ pk —
+    /// the same seed `generate_request` uses), the selected entries are
+    /// regenerated from `(pk, tick, i)`, and the Argon2id→BLAKE3 replay must
+    /// reproduce `audit_hash`. Cost = sample × 32 MB Argon2id (7 of 64 ≈ 0.2 s
+    /// on this box) — Core cannot pay it in the guest; the issuer can. The
+    /// accumulator itself is not replayed: grinding it costs the full chain.
+    pub fn verify_self_audit_sample(
+        validator_pk: &[u8; 32],
+        tick: u64,
+        entry_count: u32,
+        sample_size: u32,
+        full_accumulator: &[u8; 32],
+        audit_hash: &[u8; 32],
+    ) -> Result<(), &'static str> {
+        if entry_count == 0 { return Err("empty audit"); }
+        let expected_sample = (entry_count as f64 * PULSE_SAMPLE_RATIO).ceil().max(1.0) as u32;
+        if sample_size != expected_sample.min(entry_count) { return Err("sample size is not the protocol's for this entry count"); }
+        let seed = audit_select_seed(full_accumulator, validator_pk);
+        let selected = fiat_shamir_select(&seed, entry_count, sample_size);
+        let entries: Vec<TxDigest> = selected.iter().map(|&i| Self::self_audit_entry(validator_pk, tick, i)).collect();
+        if Self::replay_chain_from_raw(&entries) != *audit_hash { return Err("audit_hash does not reproduce from the claimed seed — the work was not done for this key and tick"); }
+        Ok(())
+    }
+
     fn replay_chain_from_raw(entries: &[TxDigest]) -> [u8; 32] {
         let mut subset_acc = [0u8; 32];
         for digest in entries {
@@ -586,12 +739,8 @@ impl AuditBuffer {
             // Argon2id memory-hard work (same as accumulate/compute_subset_hash)
             let argon2_output = Self::argon2id_hash(&subset_acc, payload.as_bytes());
 
-            // BLAKE3 chain (same domain tag as compute_subset_hash)
-            let mut chain_input = Vec::with_capacity(18 + 32 + 32);
-            chain_input.extend_from_slice(b"AXIOM_AUDIT_VERIFY");
-            chain_input.extend_from_slice(&subset_acc);
-            chain_input.extend_from_slice(&argon2_output);
-            subset_acc = *blake3::hash(&chain_input).as_bytes();
+            // BLAKE3 chain — THE builder (KI#55 B2#2).
+            subset_acc = audit_chain_step(&subset_acc, &argon2_output);
         }
         subset_acc
     }
@@ -705,6 +854,33 @@ impl WalletCache {
     }
 }
 
+#[cfg(feature = "std")]
+/// `AXIOM_AUDIT_SELECT` — the Fiat-Shamir seed of a Pulse audit sample (YPX-009
+/// §4.2; YP Appendix): BLAKE3("AXIOM_AUDIT_SELECT" ‖ accumulator ‖ validator_pk).
+/// ONE builder (Pattern 1, KI#55 B2#2, 2026-10-02) for the prover
+/// (`AuditBuffer::generate_request`) and the issuer's verifier
+/// (`verify_self_audit_sample`) — until this date each assembled it by hand.
+fn audit_select_seed(accumulator: &[u8; 32], validator_pk: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"AXIOM_AUDIT_SELECT");
+    h.update(accumulator);
+    h.update(validator_pk);
+    *h.finalize().as_bytes()
+}
+
+/// `AXIOM_AUDIT_VERIFY` — one step of the audit-subset chain (YPX-009 §4.3; YP
+/// Appendix): BLAKE3("AXIOM_AUDIT_VERIFY" ‖ subset_acc ‖ argon2id_output).
+/// ONE builder (KI#55 B2#2): `replay_chain_from_raw` is the only caller, and the
+/// prover's `compute_subset_hash` goes through it.
+#[cfg(feature = "std")]
+fn audit_chain_step(subset_acc: &[u8; 32], argon2id_output: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"AXIOM_AUDIT_VERIFY");
+    h.update(subset_acc);
+    h.update(argon2id_output);
+    *h.finalize().as_bytes()
+}
+
 /// Fiat-Shamir deterministic subset selection.
 /// Selects `count` unique indices from [0, total) using seed.
 #[cfg(feature = "std")]
@@ -736,17 +912,23 @@ impl core::fmt::Display for AvmError {
             Self::LoadError(msg) => write!(f, "Load error: {}", msg),
             Self::ExecutionError(msg) => write!(f, "Execution error: {}", msg),
             Self::RuntimeVerificationFailed => write!(f, "Runtime verification failed"),
+            // Corrected 2026-09-26: this text said "demanded PEER audit … Core
+            // self-terminating". `AuditTimeout` is returned ONLY for a SELF audit
+            // (`enforce_audit_pre`; a peer timeout bans the target instead), and it
+            // is a refusal of this and every later execution until restart, not a
+            // process exit (YP §23.14 AS BUILT item 3).
             Self::AuditTimeout { challenge_nonce, .. } => write!(
-                f, "AXIOM FATAL: §23.14 audit timeout — Lambda failed to complete \
-                demanded peer audit (nonce: {}). Core self-terminating. \
-                Restart required (VBC re-verification penalty).",
+                f, "AXIOM FATAL: §23.14 audit timeout — Lambda did not confirm this validator's \
+                own SELF-audit demand (nonce: {}). Every execution is refused until restart \
+                (VBC re-verification penalty).",
                 hex::encode(&challenge_nonce[..8])
             ),
             Self::ValidatorBanned { validator_pk, reason } => write!(
                 f, "AXIOM: §23.14.6 TX rejected — witness validator {} is banned ({:?}). \
-                Ban expires after 24 hours or AVM restart.",
+                Ban expires after {} or AVM restart.",
                 hex::encode(&validator_pk[..core::cmp::min(8, validator_pk.len())]),
-                reason
+                reason,
+                peer_audit_ban_duration_text()
             ),
             Self::PulseNotReady => write!(
                 f, "AXIOM: Core not ready — pulse calibration pending. \
@@ -832,10 +1014,9 @@ pub struct AvmInterpreter {
     /// Without `pulse-gate`, this is always true (auto-calibrate at startup).
     pulse_ready: AtomicBool,
 
-    /// YPX-009 ignition: timestamp (Instant) when ignition TX was submitted.
-    /// Used to measure round-trip time through the full ZKVM pipeline.
-    /// Only set during ignition sequence (pulse-gate feature).
-    ignition_t0: Mutex<Option<std::time::Instant>>,
+    // `ignition_t0` (a host `Instant`) DELETED 2026-10-03 (KI#125): the forbidden
+    // host timer. The ignition is timed by two Nabla-signed readings judged by Core
+    // mode `ZkpQualify` (YPX-007 §9, YPX-009 §6.1a).
 
     /// §23.14.6 tick discipline: highest validated TARDIS tick stamp observed
     /// across executions (from the transaction's `epoch` — a unix-second-valued
@@ -844,6 +1025,41 @@ pub struct AvmInterpreter {
     /// is permitted only at the TARDIS root and the tardis.rs forward-drift
     /// check.
     last_validated_tick: AtomicU64,
+
+    /// OPERATIONAL DISPLAY ONLY (dashboard audit-demand card) — never a consensus
+    /// input. The AVM host is created fresh on every Lambda start
+    /// (`CoreClient::new`), so these mark the LAST AVM RESTART: `restart_wall_clock`
+    /// is the unix-second wall clock at creation, and `restart_tick` is the FIRST
+    /// attested tick observed after restart (set-once). Wall clock is permitted
+    /// here because it is pure operator display — §23.14 bans still judge only on
+    /// `last_validated_tick`, never on this. Both reset on restart, which is the point.
+    restart_wall_clock: u64,
+    restart_tick: AtomicU64,
+
+    /// §23.14.1 peer-audit TIME-BOND: the ATTESTED tick (oods) at which this
+    /// host last fired a peer-audit demand — volume trigger OR time-bond. HOST
+    /// MEMORY, exactly like `pending_audit` and the pulse buffer: it is NOT a
+    /// consensus input, is never carried on the wire, is never written into a
+    /// re-executed `PublicOutputs` field, and resets to 0 on AVM restart (which
+    /// merely lets one early time-bond fire after a restart — harmless). It is
+    /// consistent across every execution until the ELF restarts, which is the
+    /// same model the peer audit is already built on (the owner, 2026-09-21). 0 =
+    /// none fired yet. Advanced only under the `pending_audit` lock in
+    /// `enforce_audit_post`.
+    last_peer_audit_demand_tick: AtomicU64,
+
+    /// §23.14 AS BUILT item 10 (2026-09-26): which trigger armed each PEER
+    /// demand — the guest volume trigger vs the host time-bond — so a run can
+    /// prove BOTH paths executed ("make sure time bonded audit is executed").
+    peer_audits_armed_volume: AtomicU64,
+    peer_audits_armed_time_bond: AtomicU64,
+    /// Operator counters for the validator dashboard (2026-09-26, the owner: "how many
+    /// time self/peer audit happend"): SELF demands armed / confirmed, and every
+    /// ban this validator issued (cumulative — `peer_audit_bans` holds only the
+    /// live ones, and a ban lifts). Host-side, CoreID-neutral; reset on restart.
+    self_audits_armed: AtomicU64,
+    self_audits_passed: AtomicU64,
+    peer_audit_bans_issued: AtomicU64,
 
     /// Cranelift JIT engine — compiled ONCE at startup, reused for every TX.
     /// The JIT translates the entire RISC-V ELF to native code on first use.
@@ -854,6 +1070,15 @@ pub struct AvmInterpreter {
     #[cfg(feature = "cranelift-jit-backend")]
     #[allow(dead_code)]
     jit_engine: Option<std::sync::Arc<crate::riscv::jit::JitEngine>>,
+
+    /// True when the JIT backend was compiled in but FAILED to build at startup
+    /// (the host could not map executable memory) and execution fell back to the
+    /// interpreter. Correctness is unaffected — the interpreter runs the SAME
+    /// committed ELF and produces a valid DMAP attestation — but throughput drops
+    /// ~20-30x. Surfaced via `jit_degraded()` so health/status can flag a validator
+    /// whose host needs fixing and a restart. False in a clean JIT build, and in
+    /// any build without `cranelift-jit-backend` (interpreter is the chosen runtime).
+    jit_degraded: AtomicBool,
 }
 
 #[cfg(feature = "std")]
@@ -902,26 +1127,57 @@ impl AvmInterpreter {
                                     eprintln!("[AVM-JIT] Compiled {} blocks in {:.1}s", compiled, t0.elapsed().as_secs_f64());
                                     Some(jit)
                                 }
+                                // ALERT-AND-CONTINUE (not silent, not fatal). The JIT is a pure
+                                // PERFORMANCE backend (~20-30x over the interpreter, per Cargo.toml).
+                                // It has NOTHING to do with DMAP correctness: the interpreter executes
+                                // the SAME committed ELF (same CoreID) and produces a VALID DMAP
+                                // attestation (Merkle-consistent, CoreID-bound) that verifies exactly
+                                // like a JIT-produced one — the verifier never asks which backend ran.
+                                // So a JIT build here ALSO ships the interpreter (default features), and
+                                // a fallback is CORRECT, just ~20-30x slower. The only real defect is
+                                // SILENCE: an operator can't tell a validator dropped to 1/20-1/30 speed.
+                                // So warn LOUD + keep running on the interpreter, and set jit_degraded so
+                                // health/status surfaces it until the host is fixed and the process
+                                // restarts. We do NOT crash a correct-but-slow validator (a dead validator
+                                // is worse than a slow one). See "AVM is production runtime".
                                 Err(e) => {
-                                    eprintln!("[AVM-JIT] Translation failed: {} — falling back to interpreter", e);
+                                    Self::jit_degraded_warn(&format!("JIT translation failed ({})", e));
                                     None
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("[AVM-JIT] ELF load failed: {:?} — falling back to interpreter", e);
+                            Self::jit_degraded_warn(&format!("ELF load into JIT memory failed ({:?})", e));
                             None
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[AVM-JIT] Init failed: {} — falling back to interpreter", e);
+                    Self::jit_degraded_warn(&format!("JIT engine init failed ({})", e));
                     None
                 }
             };
             engine.map(std::sync::Arc::new)
         };
 
+        Self::assemble(
+            bytecode, runtime_fingerprint, buffer, ready,
+            #[cfg(feature = "cranelift-jit-backend")] jit_engine,
+        )
+    }
+
+    /// THE ONE PLACE THE STRUCT IS ASSEMBLED. `new()` and the test-only
+    /// constructor both come through here, so a field added to the struct is
+    /// added once (RULE 1). Before 2026-09-10 the `mod pulse` tests carried
+    /// two hand-written struct literals; when `jit_degraded` was added they
+    /// silently stopped compiling in every non-riscv build (handoff §14.21).
+    fn assemble(
+        bytecode: Vec<u8>,
+        runtime_fingerprint: [u8; 32],
+        buffer: AuditBuffer,
+        ready: bool,
+        #[cfg(feature = "cranelift-jit-backend")] jit_engine: Option<std::sync::Arc<crate::riscv::jit::JitEngine>>,
+    ) -> Self {
         Self {
             bytecode,
             runtime_fingerprint,
@@ -931,11 +1187,61 @@ impl AvmInterpreter {
             wallet_cache: Mutex::new(WalletCache::new()),
             validator_pk: Mutex::new(None),
             pulse_ready: AtomicBool::new(ready),
-            ignition_t0: Mutex::new(None),
             last_validated_tick: AtomicU64::new(0),
+            restart_wall_clock: {
+                #[cfg(feature = "std")]
+                { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
+                #[cfg(not(feature = "std"))]
+                { 0 }
+            },
+            restart_tick: AtomicU64::new(0),
+            last_peer_audit_demand_tick: AtomicU64::new(0),
+            peer_audits_armed_volume: AtomicU64::new(0),
+            peer_audits_armed_time_bond: AtomicU64::new(0),
+            self_audits_armed: AtomicU64::new(0),
+            self_audits_passed: AtomicU64::new(0),
+            peer_audit_bans_issued: AtomicU64::new(0),
+            #[cfg(feature = "cranelift-jit-backend")]
+            jit_degraded: AtomicBool::new(jit_engine.is_none()),
+            #[cfg(not(feature = "cranelift-jit-backend"))]
+            jit_degraded: AtomicBool::new(false),
             #[cfg(feature = "cranelift-jit-backend")]
             jit_engine,
         }
+    }
+
+    /// Tests only: no self-benchmark (~200 ms of Argon2id per construction),
+    /// no JIT; `ready` sets the pulse gate directly. Same assembly as `new()`.
+    #[cfg(test)]
+    pub(crate) fn new_uncalibrated(bytecode: Vec<u8>, runtime_fingerprint: [u8; 32], ready: bool) -> Self {
+        Self::assemble(
+            bytecode, runtime_fingerprint, AuditBuffer::new(), ready,
+            #[cfg(feature = "cranelift-jit-backend")] None,
+        )
+    }
+
+    /// Whether the JIT backend failed to build and this instance is running on the
+    /// interpreter (correct, valid DMAP, but ~20-30x slower). Health/status surfaces
+    /// this so an operator knows the host needs fixing + a restart. See the
+    /// alert-and-continue path in `new()`.
+    pub fn jit_degraded(&self) -> bool {
+        self.jit_degraded.load(Ordering::Acquire)
+    }
+
+    /// Emit the LOUD, greppable degraded-mode warning (used at each JIT-init failure
+    /// point in `new()`). Not silent by design, and not fatal: the interpreter is a
+    /// correct executor of the committed ELF — it just cannot keep up under load.
+    #[cfg(feature = "cranelift-jit-backend")]
+    fn jit_degraded_warn(reason: &str) {
+        eprintln!(
+            "[AVM-JIT] *** DEGRADED *** {reason}. The host could not map executable memory \
+             (free memory, or relax W^X / allow executable mappings). Falling back to the \
+             INTERPRETER: CORRECT — same committed ELF, valid DMAP attestation (CoreID-bound) — \
+             but ~20-30x SLOWER, so this validator may not keep up under load. This is a pure \
+             PERFORMANCE fallback (the JIT does nothing for DMAP correctness). Not silent and not \
+             a crash by design; FIX THE HOST and RESTART to restore JIT speed. jit_degraded()=true \
+             until then."
+        );
     }
 
     /// Set this validator's Ed25519 public key (used for Fiat-Shamir audit seed).
@@ -968,25 +1274,22 @@ impl AvmInterpreter {
         self.pulse_ready.store(true, Ordering::Release);
     }
 
-    /// Process ignition TX (YPX-009 §8.4) — phase 1 of 2.
+    /// Process ignition TX (YPX-009 §6.1) — phase 1 of 2.
     ///
     /// Called when Lambda sends the ignition TX through Core. This method:
-    /// 1. Records t0 (start time) — Core measures its own timing
-    /// 2. Bypasses the pulse gate (ignition TX is the ONLY exception)
-    /// 3. Executes the TX through the normal AVM pipeline
+    /// 1. Bypasses the pulse gate (ignition TX is the ONLY exception)
+    /// 2. Executes the TX through the normal AVM pipeline
     ///
-    /// After this, Lambda must generate ZKVM proof and call `complete_ignition()`
-    /// with the proof bytes. Core verifies the proof, measures delta = t1 - t0,
-    /// determines hardware tier from the round-trip time, and unblocks.
+    /// After this, Lambda proves the TX (when it has a prover) and calls
+    /// `complete_ignition()`. Timing is NOT measured here: the ignition is also the
+    /// ZKP qualification run, timed by two Nabla-signed readings and judged by Core
+    /// mode `ZkpQualify` (YPX-007 §9, YPX-009 §6.1a).
     ///
     /// This is the restart penalty: when Lambda fails a pulse audit, Core
     /// self-terminates. Restart requires a new ignition TX — real operational
     /// downtime because ZKVM proving takes seconds to minutes.
     pub fn process_ignition(&self, inputs: PublicInputs) -> Result<PublicOutputs, AvmError> {
-        // Record t0 — Core's own clock, Lambda cannot influence
-        *self.ignition_t0.lock().unwrap() = Some(std::time::Instant::now());
-
-        eprintln!("[YPX-009] Ignition TX: processing (t0 recorded)");
+        eprintln!("[YPX-009] Ignition TX: processing");
 
         // Execute through normal pipeline — bypasses pulse gate
         // This is the ONLY path that runs while pulse_ready is false.
@@ -1008,31 +1311,20 @@ impl AvmInterpreter {
         }
 
         // Native execution fallback
-        let _host = HostFunctions::new(0, self.runtime_fingerprint);
+        let _host = HostFunctions::new();
         let outputs = execute_core(inputs);
         Ok(outputs)
     }
 
-    /// Complete ignition (YPX-009 §8.4) — phase 2 of 2.
+    /// Complete ignition (YPX-009 §6.1) — phase 2 of 2.
     ///
-    /// Called after Lambda generates a ZKVM proof for the ignition TX.
-    /// Core verifies the proof is real (not empty, well-formed), then:
-    /// 1. Measures delta = t1 - t0 (round-trip through full ZKVM pipeline)
-    /// 2. Runs BLAKE3 self-benchmark (Core trusts nobody)
-    /// 3. Determines hardware tier from BLAKE3 throughput
-    /// 4. Logs the ZKVM round-trip time (informational — tier is from BLAKE3)
-    /// 5. Sets `pulse_ready = true` — Core starts serving
-    ///
-    /// The ZKVM round-trip proves the hardware actually has a working prover.
-    /// The tier determination uses BLAKE3 (deterministic, cheat-proof).
+    /// Called after Lambda proved the ignition TX (or, with no prover, with the
+    /// DMAP marker). It checks ONLY that the proof bytes are non-empty and ≤ 10 MB —
+    /// it never verified a STARK (YPX-009 §6.1a: STARK validity is Lambda's host
+    /// `ZkvmVerifier::verify_checkpoint`; timing is the Nabla tick bracket judged by
+    /// Core mode `ZkpQualify`, YPX-007 §9). Then it runs the Argon2id self-benchmark
+    /// and sets `pulse_ready = true` — Core starts serving.
     pub fn complete_ignition(&self, proof_bytes: &[u8]) -> Result<(), AvmError> {
-        let t0 = self.ignition_t0.lock().unwrap().take()
-            .ok_or_else(|| AvmError::ExecutionError(
-                "complete_ignition() called without process_ignition()".into()
-            ))?;
-
-        let delta = t0.elapsed();
-
         // Verify proof is non-empty (H1: empty cheque proofs rejected)
         if proof_bytes.is_empty() {
             return Err(AvmError::ExecutionError(
@@ -1053,11 +1345,7 @@ impl AvmInterpreter {
         buffer.self_benchmark();
         drop(buffer);
 
-        eprintln!(
-            "[YPX-009] Ignition complete: ZKVM round-trip={:.1}s, proof={}KB",
-            delta.as_secs_f64(),
-            proof_bytes.len() / 1024,
-        );
+        eprintln!("[YPX-009] Ignition complete: proof={}KB", proof_bytes.len() / 1024);
 
         // Unblock Core — start serving transactions
         self.pulse_ready.store(true, Ordering::Release);
@@ -1069,7 +1357,7 @@ impl AvmInterpreter {
     /// Otherwise, processes any confirmation and decrements if pending.
     ///
     /// For peer-audits, also checks wall-clock timeout (10 minutes).
-    /// On peer-audit timeout, bans the target for 24h instead of self-terminating.
+    /// On peer-audit timeout, bans the target for the ban window (`peer_audit_ban_duration_text`: 24 h real, 1 h dev) instead of self-terminating.
     fn enforce_audit_pre(&self, inputs: &PublicInputs) -> Result<(), AvmError> {
         // §23.14.6 tick discipline: advance the validated-tick watermark from
         // this TX's epoch (monotonic max — a replayed old epoch can't rewind it).
@@ -1080,6 +1368,11 @@ impl AvmInterpreter {
         self.last_validated_tick
             .fetch_max(inputs.transaction.epoch, Ordering::AcqRel);
 
+        // OPERATIONAL DISPLAY: record the FIRST attested tick observed after this
+        // AVM host restarted (set-once; the CAS fails harmlessly on every later tx).
+        let _ = self.restart_tick.compare_exchange(
+            0, inputs.transaction.epoch, Ordering::AcqRel, Ordering::Relaxed);
+
         // §23.14.6: Check ban list — reject TX if any witness is banned
         self.check_witness_bans(inputs)?;
 
@@ -1089,41 +1382,66 @@ impl AvmInterpreter {
             // Check for confirmation in inputs
             if let Some(ref confirmation) = inputs.audit_confirmation {
                 if !audit.is_peer {
-                    // Self-audit confirmation path (unchanged)
+                    // Self-audit confirmation path (FIXED 2026-09-24, see
+                    // `PendingAudit::self_expected_digest`)
                     // Step 1: Verify nonce + target match (binding)
                     if axiom_core_logic::audit::verify_audit_nonce(
                         &audit.demand, confirmation,
                     ) {
-                        // Step 2: Verify content — hash raw DB data, compare against
-                        // stored TxDigest in audit buffer. Lambda does zero crypto;
-                        // Core hashes the raw data Lambda sent back.
-                        let buffer = self.audit_buffer.lock().unwrap();
-                        let content_valid = buffer.entries.iter()
-                            .find(|d| d.tx_number == audit.trigger_tx_number)
+                        // Step 2: Verify content — hash the raw DB fields Lambda sent
+                        // back against the digest of the triggering execution, fixed
+                        // at arming. Lambda does zero crypto; Core hashes. No ring
+                        // lookup: the pulse audit resets the ring after every accepted
+                        // tx, which is why the old lookup failed after any reset.
+                        let content_valid = audit.self_expected_digest.as_ref()
                             .map(|stored| axiom_core_logic::audit::verify_audit_content(
                                 confirmation, stored,
                             ))
-                            .unwrap_or(false); // TX not in buffer = fail
-                        drop(buffer);
+                            .unwrap_or(false); // no digest = not a self demand we armed = fail
 
                         if content_valid {
                             // Audit completed successfully — clear pending
                             *pending = None;
+                            self.self_audits_passed.fetch_add(1, Ordering::Relaxed);
                             return Ok(());
                         }
                         // Content mismatch — Lambda tampered with DB. Countdown continues.
                         eprintln!("§23.14: Audit content mismatch for trigger_tx_number={}", audit.trigger_tx_number);
+                    } else {
+                        // Wrong nonce/target — ignore, countdown continues. NAMED (RULE 3
+                        // shape 2, 2026-09-24): this was silent, and a self-audit that
+                        // received two confirmations and still expired could not be
+                        // told from one that received none.
+                        eprintln!("§23.14: Audit confirmation ignored — nonce/target do not match the pending demand (demand nonce={} target={} / confirmation nonce={} target={}); remaining={}",
+                                  hex::encode(&audit.demand.challenge_nonce[..8]),
+                                  hex::encode(&audit.demand.target_validator_pk[..core::cmp::min(8, audit.demand.target_validator_pk.len())]),
+                                  hex::encode(&confirmation.challenge_nonce[..8]),
+                                  hex::encode(&confirmation.target_validator_pk[..core::cmp::min(8, confirmation.target_validator_pk.len())]),
+                                  audit.remaining);
                     }
-                    // Wrong nonce/target — ignore, countdown continues
                 }
                 // Peer-audit confirmations are NOT handled here — they come via
                 // handle_peer_audit_response() which calls clear_peer_audit() or ban_validator().
             }
 
-            // Check peer-audit wall-clock timeout (10 minutes)
-            if audit.is_peer {
-                if let Some(started) = audit.started_at {
-                    if started.elapsed().as_secs() >= axiom_core_logic::types::PEER_AUDIT_TIMEOUT_SECS {
+            // NAMED (RULE 3 shape 2, 2026-09-24): a SELF demand ticking down with NO
+            // confirmation in this execution's inputs. Bounded to the 10-TX self
+            // countdown, and the one line that separates "Lambda never threaded a
+            // confirmation into this execution kind" from "it did and it mismatched".
+            if !audit.is_peer && inputs.audit_confirmation.is_none() {
+                eprintln!("§23.14: self-audit pending (target={} remaining={}) but this {:?} execution carries NO audit_confirmation",
+                          hex::encode(&audit.demand.target_validator_pk[..core::cmp::min(8, audit.demand.target_validator_pk.len())]),
+                          audit.remaining, inputs.mode);
+            }
+
+            // Peer-audit response deadline: PEER_AUDIT_TIMEOUT_TICKS past the
+            // watermark at dispatch (tick-disciplined, §23.14.1). `dispatched_at_tick`
+            // is only ever set by `mark_peer_audit_dispatched`, so this arm cannot
+            // fire for a request that never left this node (see `dispatched`).
+            if audit.is_peer && audit.dispatched {
+                if let Some(at) = audit.dispatched_at_tick {
+                    let now_tick = self.last_validated_tick.load(Ordering::Acquire);
+                    if now_tick.saturating_sub(at) >= axiom_core_logic::types::PEER_AUDIT_TIMEOUT_TICKS {
                         // Peer-audit timed out — ban the target, don't self-terminate
                         let target_pk = audit.demand.target_validator_pk.clone();
                         *pending = None;
@@ -1137,10 +1455,20 @@ impl AvmInterpreter {
                 }
             }
 
-            // No valid confirmation — decrement countdown
+            // No valid confirmation — decrement countdown.
+            // §23.14.1 silence-handling ruling (the owner 2026-09-21, VERIFIED matches
+            // 2026-09-21): NEVER ban on a single silence. Silence is an
+            // unattributable A↔B condition and an immediate strike is a griefing
+            // vector (forge B's silence → B banned). A peer is banned ONLY on an
+            // ATTRIBUTABLE failure: a wrong hash (HashMismatch, in Lambda's
+            // handle_peer_audit_response) or non-response past the FULL countdown
+            // below (NonResponds). The `remaining` budget IS the grace window — do
+            // not shorten it to 0 or ban before it drains, or this becomes the
+            // single-silence ban the ruling forbids.
             if audit.remaining == 0 {
-                if audit.is_peer {
-                    // Peer-audit TX countdown expired — ban target, don't self-terminate
+                if audit.is_peer && audit.dispatched {
+                    // Peer-audit TX countdown expired AFTER the request was sent —
+                    // B's non-response is attributable: ban target, don't self-terminate
                     let target_pk = audit.demand.target_validator_pk.clone();
                     *pending = None;
                     drop(pending);
@@ -1151,6 +1479,13 @@ impl AvmInterpreter {
                     return Ok(());
                 }
                 // Self-audit: Lambda failed to comply. Self-terminate.
+                // Peer-audit NEVER DISPATCHED: also Lambda failing to comply (it
+                // did not initiate the audit Core demanded) — the same penalty,
+                // and NOT a ban of the peer that was never asked (`dispatched`).
+                if audit.is_peer {
+                    eprintln!("§23.14: peer-audit demand expired UNDISPATCHED — Lambda never sent the request to target {}; this is our non-compliance, the target is NOT banned",
+                              hex::encode(&audit.demand.target_validator_pk[..core::cmp::min(8, audit.demand.target_validator_pk.len())]));
+                }
                 return Err(AvmError::AuditTimeout {
                     challenge_nonce: audit.demand.challenge_nonce,
                     target_validator_pk: audit.demand.target_validator_pk.clone(),
@@ -1169,8 +1504,7 @@ impl AvmInterpreter {
     /// ban holds for AT LEAST that many ticks.
     #[inline]
     fn ban_window_stamp() -> u64 {
-        axiom_core_logic::types::PEER_AUDIT_BAN_TICKS
-            .saturating_mul(axiom_core_logic::types::TICK_INTERVAL_SECS)
+        peer_audit_ban_window_secs()
     }
 
     /// §23.14.6: Check if any CURRENT TX witness (overlapped_signatures) is banned.
@@ -1208,7 +1542,7 @@ impl AvmInterpreter {
     }
 
     /// §23.14.6: Ban a validator for peer-audit failure.
-    /// Adds to ban list (survives across TXs, clears on restart or after 24h).
+    /// Adds to ban list (survives across TXs, clears on restart or after the ban window — 24 h real, 1 h dev).
     pub fn ban_validator(
         &self,
         validator_pk: Vec<u8>,
@@ -1218,6 +1552,7 @@ impl AvmInterpreter {
         // A ban can only arise from TX processing (the audit demand is
         // generated during execute), so the watermark holds a real tick here.
         let now_tick = self.last_validated_tick.load(Ordering::Acquire);
+        self.peer_audit_bans_issued.fetch_add(1, Ordering::Relaxed);
 
         let mut bans = self.peer_audit_bans.lock().unwrap();
         // Don't duplicate — update existing ban
@@ -1249,6 +1584,43 @@ impl AvmInterpreter {
         })
     }
 
+    /// §23.14: Lambda has handed the pending peer-audit request to the carrier.
+    /// Starts B's response deadline (`dispatched_at_tick` = the watermark now)
+    /// and makes the eventual `NonResponds` ban attributable (see
+    /// `PendingAudit::dispatched`). Returns whether a pending PEER audit was
+    /// marked. Idempotent: a second call does not restart the deadline.
+    pub fn mark_peer_audit_dispatched(&self) -> bool {
+        let mut pending = self.pending_audit.lock().unwrap();
+        match pending.as_mut() {
+            Some(a) if a.is_peer => {
+                if !a.dispatched {
+                    a.dispatched = true;
+                    a.dispatched_at_tick = Some(self.last_validated_tick.load(Ordering::Acquire));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// §23.14.3: the carrier FAILED to send the request after hand-off (ANTIE's
+    /// SMTP error, relayed to Lambda). The request never left this node, so B's
+    /// deadline must not run: back to undispatched — the countdown continues and
+    /// the next witness build retries the send; an expiry is then OUR
+    /// non-compliance, never B's silence. Returns whether a pending PEER audit
+    /// was un-marked. Closes the KI#211 residual (2026-09-24).
+    pub fn unmark_peer_audit_dispatched(&self) -> bool {
+        let mut pending = self.pending_audit.lock().unwrap();
+        match pending.as_mut() {
+            Some(a) if a.is_peer && a.dispatched => {
+                a.dispatched = false;
+                a.dispatched_at_tick = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// §23.14.6: Clear a pending peer-audit (called when response received and verified).
     pub fn clear_peer_audit(&self) {
         let mut pending = self.pending_audit.lock().unwrap();
@@ -1265,23 +1637,83 @@ impl AvmInterpreter {
             .and_then(|a| a.peer_expected_hash)
     }
 
-    /// §23.14.6: Get the pending peer-audit request data (for Lambda to send via ANTIE).
+    /// §23.14.6: Get the pending peer-audit request data (for Lambda to sign +
+    /// send via ANTIE). KI#207: the request carries NO expected hash — B is not
+    /// handed the answer. We only emit a request once A has its OWN expected
+    /// value (`peer_expected_hash`, kept locally to judge the reply). KI#175:
+    /// `requester_sig` is left empty here; Lambda signs it with the operational
+    /// wallet at send time (Core holds no keys).
     pub fn pending_peer_audit_request(&self) -> Option<axiom_core_logic::types::PeerAuditRequest> {
         let pending = self.pending_audit.lock().unwrap();
         if let Some(ref audit) = *pending {
-            if audit.is_peer {
-                if let Some(expected_hash) = audit.peer_expected_hash {
-                    let our_pk = self.validator_pk.lock().unwrap();
-                    return Some(axiom_core_logic::types::PeerAuditRequest {
-                        txid: audit.demand.trigger_txid,
-                        expected_hash,
-                        challenge_nonce: audit.demand.challenge_nonce,
-                        requester_pk: our_pk.as_ref().cloned().unwrap_or_default(),
-                    });
-                }
+            if audit.is_peer && audit.peer_expected_hash.is_some() {
+                let our_pk = self.validator_pk.lock().unwrap();
+                return Some(axiom_core_logic::audit::generate_peer_audit_request(
+                    &audit.demand.trigger_txid,
+                    &audit.demand.challenge_nonce,
+                    &our_pk.as_ref().cloned().unwrap_or_default(),
+                ));
             }
         }
         None
+    }
+
+    /// §23.14.6: Get the pending peer-audit DEMAND (carries `target_validator_pk`).
+    /// Both the volume trigger AND the time-bond arm the AVM `pending_audit` via
+    /// `enforce_audit_post`; only the volume trigger also writes
+    /// `outputs.audit_demand` (the time-bond stays host-only for re-execution
+    /// safety). So Lambda reads this to learn a TIME-BOND demand's target and
+    /// mirror it into its own `pending_audit` — without which a time-bond audit
+    /// never sends a request and falsely bans the target for NonResponds
+    /// (surfaced live 2026-09-22). Same guard as `pending_peer_audit_request`.
+    pub fn pending_peer_audit_demand(&self) -> Option<axiom_core_logic::types::AuditDemand> {
+        let pending = self.pending_audit.lock().unwrap();
+        pending.as_ref()
+            .filter(|a| a.is_peer && a.peer_expected_hash.is_some())
+            .map(|a| a.demand.clone())
+    }
+
+    /// §23.14.1: The pending TIME-BOND demand regardless of self/peer, so Lambda
+    /// can mirror a SELF-audit time-bond into its own `pending_audit`.
+    ///
+    /// `pending_peer_audit_demand` (above) returns ONLY peer demands, and the
+    /// guest VOLUME trigger (`outputs.audit_demand`, the other mirror source) is
+    /// `#[cfg(not(dev-mode))]`-gated OUT of dev builds — so on the dev fleet EVERY
+    /// demand is a host time-bond, and a self-target was mirrored to Lambda by
+    /// neither path. Lambda's `resolve_audit_confirmation` then found nothing to
+    /// confirm and the AVM countdown SELF-TERMINATED the validator (KI#210/#207,
+    /// live 2026-09-23: `AXIOM FATAL: §23.14 audit timeout` — the message text
+    /// then said "peer audit" (corrected 2026-09-26), but `AuditTimeout` is only
+    /// ever returned for a self-audit at `enforce_audit_pre`). ⚠ Since 537ca629
+    /// (2026-09-26) the volume trigger is compiled into dev Cores too, so "EVERY
+    /// dev demand is a time-bond" above is history. A corrupt DB still self-terminates
+    /// (the confirmation Lambda builds is content-verified against the audit
+    /// buffer), so this only unblocks the honest path. Returns the demand
+    /// whenever the AVM holds a pending audit; the `!lambda_has_pending` guard at
+    /// the call site keeps the mirror idempotent.
+    pub fn pending_time_bond_demand(&self) -> Option<axiom_core_logic::types::AuditDemand> {
+        let pending = self.pending_audit.lock().unwrap();
+        pending.as_ref().map(|a| a.demand.clone())
+    }
+
+    /// §23.14 AS BUILT item 10: peer demands armed by (volume, time-bond).
+    pub fn peer_audit_trigger_counts(&self) -> (u64, u64) {
+        (self.peer_audits_armed_volume.load(Ordering::Relaxed),
+         self.peer_audits_armed_time_bond.load(Ordering::Relaxed))
+    }
+
+    /// Dashboard counters: (self armed, self passed, bans issued — cumulative).
+    pub fn audit_operator_counts(&self) -> (u64, u64, u64) {
+        (self.self_audits_armed.load(Ordering::Relaxed),
+         self.self_audits_passed.load(Ordering::Relaxed),
+         self.peer_audit_bans_issued.load(Ordering::Relaxed))
+    }
+
+    /// OPERATIONAL DISPLAY: the unix-second wall clock when this AVM host was last
+    /// (re)started, and the first attested tick observed after that restart (0
+    /// until the first tx arrives). Surfaced on the dashboard audit-demand card.
+    pub fn avm_restart_info(&self) -> (u64, u64) {
+        (self.restart_wall_clock, self.restart_tick.load(Ordering::Acquire))
     }
 
     /// §23.14.6: Get the ban list (for Lambda/admin API).
@@ -1296,57 +1728,206 @@ impl AvmInterpreter {
             .collect()
     }
 
-    /// §23.14: After execution, check if Core generated an audit demand.
-    /// If so, start tracking the countdown.
-    /// Self-audit: 10 TX countdown. Peer-audit: 100 TX / 10 min countdown.
-    fn enforce_audit_post(&self, outputs: &PublicOutputs) {
-        if let Some(ref demand) = outputs.audit_demand {
-            let mut pending = self.pending_audit.lock().unwrap();
-            // Only set if no pending audit (don't override active countdown)
-            if pending.is_none() {
-                // Get current tx_number from audit buffer
-                let buffer = self.audit_buffer.lock().unwrap();
-                let current_tx_number = buffer.tx_counter;
-                drop(buffer);
-
-                // Check if this is a peer-audit (target != our PK)
-                let our_pk = self.validator_pk.lock().unwrap();
-                let is_peer = our_pk.as_ref()
-                    .map(|pk| pk.as_slice() != demand.target_validator_pk.as_slice())
-                    .unwrap_or(true); // if PK not set, treat as peer (conservative)
-
-                let countdown = if is_peer {
-                    axiom_core_logic::types::PEER_AUDIT_COUNTDOWN_TXS
-                } else {
-                    axiom_core_logic::types::AUDIT_COUNTDOWN_TXS
-                };
-
-                // For peer-audit, compute the expected hash from audit buffer
-                let peer_expected_hash = if is_peer {
-                    let buffer = self.audit_buffer.lock().unwrap();
-                    buffer.entries.iter()
-                        .find(|d| d.tx_number == current_tx_number)
-                        .map(|digest| axiom_core_logic::audit::compute_peer_audit_hash(
-                            &demand.trigger_txid,
-                            digest.sender_balance,
-                            digest.receiver_balance,
-                            &digest.state_id,
-                            digest.amount,
-                        ))
-                } else {
-                    None
-                };
-
-                *pending = Some(PendingAudit {
-                    demand: demand.clone(),
-                    remaining: countdown,
-                    trigger_tx_number: current_tx_number,
-                    is_peer,
-                    started_at: if is_peer { Some(std::time::Instant::now()) } else { None },
-                    peer_expected_hash,
-                });
-            }
+    /// §23.14.1 peer-audit TIME-BOND (host side). The guest volume trigger
+    /// (`outputs.audit_demand`, `should_trigger_audit`, 1-in-`AUDIT_TRIGGER_RATE`)
+    /// never fires for a low-traffic validator. This bonds a peer audit to the
+    /// ATTESTED tick instead: on the first eligible witnessed Accept once the
+    /// oods tick has advanced more than `AUDIT_MAX_TICK_GAP` past the last
+    /// peer-audit demand, generate one host-side.
+    ///
+    /// # Re-execution safety (why this is host-side, not in the guest)
+    /// The demand it returns is NEVER written back into `outputs.audit_demand`
+    /// (that field is guest-produced, deterministic from txid, and rides the
+    /// ELF/CoreID). It is consumed only to arm the host-local `pending_audit`
+    /// countdown — exactly like the existing peer countdown and the pulse
+    /// self-audit trigger, both of which already live in host memory and are
+    /// NOT re-executed. Because it depends on `last_peer_audit_demand_tick`
+    /// (per-executor host state), putting it into a re-executed output would
+    /// make a fresh validator and a long-running one diverge on the same tx;
+    /// keeping it host-side produces no re-executed output, so there is no
+    /// divergence. The cost is that the time-bond carries only the host tamper
+    /// model (patch the AVM → your DMAP trace / behaviour diverges from honest
+    /// peers), NOT the ELF tamper-evidence the volume trigger has — the same
+    /// trade the countdown, the ban list and the pulse trigger already make.
+    ///
+    /// Judged against `oods_attestation.tick` (Nabla-signed, KI#130 "now",
+    /// verified in-place during the CL2/CL3 that just Accepted), NEVER tx.epoch
+    /// (client-forgeable) or wall clock. Returns None when the subsystem cannot
+    /// act: not a witnessed CL2/CL3 Accept, no attested tick, no peer to target,
+    /// or the gap has not been crossed.
+    #[cfg(not(feature = "disable-audit"))]
+    fn time_bond_demand(
+        &self,
+        inputs: &PublicInputs,
+        outputs: &PublicOutputs,
+        attested_tick: Option<u64>,
+    ) -> Option<axiom_core_logic::types::AuditDemand> {
+        // Only a witnessed round that Accepted, with a verified attested tick.
+        if outputs.result != ValidationResult::Accept {
+            return None;
         }
+        if !matches!(inputs.mode, axiom_core_logic::CoreLogicMode::CL2 | axiom_core_logic::CoreLogicMode::CL3) {
+            return None;
+        }
+        // No attested tick ⇒ no tick to judge ⇒ silent (same rule as no-tx).
+        let now = attested_tick?;
+        let last = self.last_peer_audit_demand_tick.load(Ordering::Acquire);
+        if now.saturating_sub(last) <= axiom_core_logic::types::AUDIT_MAX_TICK_GAP {
+            return None;
+        }
+        // A txid to seed the demand, and the CURRENT tx's co-witnesses to target
+        // (§23.14.2, KI#213 — the ONE selector shared with the guest volume
+        // trigger, RULE 1). Was `prev_receipts[].witness_sigs`: the PREVIOUS tx's
+        // witnesses, who never executed this tx and could only answer "unknown
+        // txid" → banned NonResponds on the first delivered request (2026-09-24).
+        let txid = outputs.txid.as_ref()?;
+        let witness_pks: Vec<Vec<u8>> = axiom_core_logic::audit::audit_target_candidates(inputs);
+        // generate_audit_demand is the SAME builder the guest volume trigger
+        // uses (RULE 1) — deterministic target selection from the witness set;
+        // None when there is no peer to audit.
+        axiom_core_logic::audit::generate_audit_demand(txid, &witness_pks)
+    }
+
+    /// disable-audit builds (dev fleet lambda/antie) run no pulse subsystem, so
+    /// the time-bond must not arm a peer audit whose expected hash can never be
+    /// computed — it would count down to a spurious ban. Matches the gate on
+    /// `pulse_post_execute`.
+    #[cfg(feature = "disable-audit")]
+    fn time_bond_demand(
+        &self,
+        _inputs: &PublicInputs,
+        _outputs: &PublicOutputs,
+        _attested_tick: Option<u64>,
+    ) -> Option<axiom_core_logic::types::AuditDemand> {
+        None
+    }
+
+    /// §23.14: After execution, arm the audit countdown if Core (volume trigger,
+    /// guest) OR the host time-bond (§23.14.1) produced a demand.
+    /// Self-audit: `AUDIT_COUNTDOWN_TXS`. Peer-audit: `PEER_AUDIT_COUNTDOWN_TXS`
+    /// / `PEER_AUDIT_TIMEOUT_SECS`.
+    fn enforce_audit_post(&self, inputs: &PublicInputs, outputs: &PublicOutputs, accumulate: bool) {
+        // §23.14 (KI#210): a demand may arm ONLY on an AUDITED execution. The
+        // trigger tx is accumulated into the audit buffer only when `accumulate`
+        // (pulse_post_execute returns early otherwise), and a self-audit can be
+        // confirmed ONLY against a buffer entry (enforce_audit_pre looks up
+        // `trigger_tx_number`). Arming on a non-audited CL2 witness produced a
+        // demand whose trigger tx was NEVER in this validator's buffer, so it could
+        // never be confirmed and the countdown self-terminated the validator (tier
+        // C residual: 10 of 15 self-terminates were demands armed on unaudited
+        // witnesses). The volume trigger (`outputs.audit_demand`) obeys the same
+        // rule — a demand about a tx that was not recorded is unanswerable.
+        if !accumulate {
+            return;
+        }
+        let mut pending = self.pending_audit.lock().unwrap();
+        // Only arm if no pending audit (don't override an active countdown).
+        // This also means the time-bond never fires while an audit is in flight.
+        if pending.is_some() {
+            return;
+        }
+
+        // The attested tick — the KI#130 "now": the Nabla-signed oods tick,
+        // verified in-place during CL2/CL3 (this runs only when the tx Accepted,
+        // so the attestation was already verified). NEVER tx.epoch or wall clock.
+        let attested_tick: Option<u64> =
+            inputs.oods_attestation.as_ref().map(|a| a.tick);
+
+        // Volume trigger (guest, ELF/CoreID) first; else the host time-bond.
+        let (demand, from_volume) = match outputs.audit_demand.clone() {
+            Some(d) => (d, true),
+            None => match self.time_bond_demand(inputs, outputs, attested_tick) {
+                Some(d) => (d, false),
+                None => return,
+            },
+        };
+
+        // Get current tx_number from audit buffer
+        let current_tx_number = {
+            let buffer = self.audit_buffer.lock().unwrap();
+            buffer.tx_counter
+        };
+
+        // Check if this is a peer-audit (target != our PK)
+        let is_peer = {
+            let our_pk = self.validator_pk.lock().unwrap();
+            our_pk.as_ref()
+                .map(|pk| pk.as_slice() != demand.target_validator_pk.as_slice())
+                .unwrap_or(true) // if PK not set, treat as peer (conservative)
+        };
+
+        let countdown = if is_peer {
+            axiom_core_logic::types::PEER_AUDIT_COUNTDOWN_TXS
+        } else {
+            axiom_core_logic::types::AUDIT_COUNTDOWN_TXS
+        };
+
+        // For peer-audit, A's expected hash = the digest of THIS execution — the
+        // exact fields `pulse_post_execute` accumulates (sender_balance = the
+        // consumed state's balance or 0, receiver_balance 0, produced state_id,
+        // amount), computed HERE from inputs/outputs.
+        //
+        // ⚠ WRONG READING, live until 2026-09-24 (KI#214): this looked the
+        // current tx up in the audit buffer by `tx_counter` — but this runs
+        // BEFORE `pulse_post_execute` accumulates it, so it found the PREVIOUS
+        // audited execution's digest (A then judged B's honest reply about the
+        // current txid as HashMismatch), or nothing at all right after a buffer
+        // reset (the pulse audit resets the ring after every accepted tx on the
+        // dev fleet: "audit chain started" precedes nearly every execution) —
+        // then `pending_peer_audit_request()` had no hash and the request was
+        // never built. Measured: demands on delta/eta 04:03/04:10Z with 6 and 1
+        // executions after them, 0 handed to ANTIE, `peer_audit_target_unresolved`
+        // 0. Every §23.14 peer audit needs this hash; it cannot depend on a ring
+        // that another subsystem resets.
+        let peer_expected_hash = if is_peer {
+            let sender_balance = inputs.current_state.as_ref().map(|s| s.balance).unwrap_or(0);
+            let state_id = outputs.produced_state_id.unwrap_or([0u8; 32]);
+            Some(axiom_core_logic::audit::compute_peer_audit_hash(
+                &demand.trigger_txid,
+                sender_balance,
+                0,
+                &state_id,
+                inputs.transaction.amount,
+            ))
+        } else {
+            None
+        };
+
+        // Reset the time-bond clock on ANY armed peer audit — volume OR
+        // time-bond — so a busy validator's frequent volume audits also satisfy
+        // the low-volume bond. Record the attested tick that judged this round;
+        // if none was present, leave the clock (the time-bond simply gains no
+        // anchor from this tx and may fire a touch sooner later — safe).
+        if is_peer {
+            if let Some(t) = attested_tick {
+                self.last_peer_audit_demand_tick.store(t, Ordering::Release);
+            }
+            let counter = if from_volume { &self.peer_audits_armed_volume } else { &self.peer_audits_armed_time_bond };
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.self_audits_armed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        *pending = Some(PendingAudit {
+            demand,
+            remaining: countdown,
+            trigger_tx_number: current_tx_number,
+            is_peer,
+            // The response deadline starts at DISPATCH (mark_peer_audit_dispatched),
+            // not here — B cannot be late answering a request A has not sent.
+            dispatched_at_tick: None,
+            peer_expected_hash,
+            dispatched: false,
+            self_expected_digest: if is_peer { None } else {
+                Some(axiom_core_logic::types::TxDigest {
+                    tx_number: current_tx_number,
+                    sender_balance: inputs.current_state.as_ref().map(|s| s.balance).unwrap_or(0),
+                    receiver_balance: 0,
+                    state_id: outputs.produced_state_id.unwrap_or([0u8; 32]),
+                    amount: inputs.transaction.amount,
+                })
+            },
+        });
     }
 
     /// YPX-009: Silicon Pulse post-execution processing.
@@ -1362,6 +1943,7 @@ impl AvmInterpreter {
         inputs: &PublicInputs,
         outputs: &mut PublicOutputs,
         _dmap_trace: Option<&DmapTrace>,
+        accumulate: bool,
     ) {
         // Only process Accept results
         if outputs.result != ValidationResult::Accept {
@@ -1424,6 +2006,21 @@ impl AvmInterpreter {
             }
         }
 
+        // ⚠ ACCUMULATE ONLY WHAT LAMBDA RECORDS (2026-09-08, the day the audit
+        // was switched on). The audit replays Lambda's TRANSACTION DB against
+        // this chain (§4.4: Lambda answers from `get_transaction_record`). Only
+        // two executions ever write that record — the FINALIZING CL3 (last hop)
+        // and the CL5 redeem. Every other Accept that reaches this AVM —
+        // non-final witness hops, CL2 pre-checks, CL8 issuance, console — has
+        // no record, so one of them in the chain makes every audit fail
+        // forever (Core answers a mismatch, keeps the entries, re-requests).
+        // The caller says which it is via `execute_audited` /
+        // `execute_with_dmap_audited`; the plain entry points still VERIFY
+        // responses (steps 1–2 above) but add nothing to the chain.
+        if !accumulate {
+            return;
+        }
+
         // 3. Build TxDigest from outputs
         buffer.tx_counter += 1;
         let tx_number = buffer.tx_counter;
@@ -1445,6 +2042,15 @@ impl AvmInterpreter {
         };
 
         buffer.accumulate(digest);
+        // Observability (2026-09-08, the day the audit was switched on for the
+        // dev fleet): the chain's first link and every emitted request print
+        // ONE line each. Without these the only trace of a live audit was a
+        // Lambda `info!` that never appeared, and nothing said whether the
+        // buffer was even filling. eprintln — the AVM has no logger.
+        if buffer.entries.len() == 1 {
+            eprintln!("[YPX-009] audit chain started (first accepted TX since reset; argon2id/s={})",
+                buffer.argon2id_per_sec);
+        }
 
         // 4. Update wallet cache with sender's new state
         if let Some(pk_bytes) = inputs.transaction.client_pk.get(..32) {
@@ -1472,6 +2078,8 @@ impl AvmInterpreter {
             let current_tick = self.estimate_tick(&inputs.transaction);
             let epoch = current_tick / axiom_core_logic::types::PULSE_EPOCH_LENGTH_TICKS;
             let request = buffer.generate_request(pk_bytes, epoch);
+            eprintln!("[YPX-009] audit request emitted: {} of {} entries, epoch={}, tick={}",
+                request.selected_indices.len(), buffer.entries.len(), epoch, current_tick);
             buffer.pending_request_tick = Some(current_tick);
             buffer.pending_request = Some(request.clone());
             outputs.audit_request = Some(request);
@@ -1494,6 +2102,7 @@ impl AvmInterpreter {
         _inputs: &PublicInputs,
         _outputs: &mut PublicOutputs,
         _dmap_trace: Option<&DmapTrace>,
+        _accumulate: bool,
     ) {
         // Audit chain disabled — no Argon2id, no nonce challenges, no pulse proofs.
     }
@@ -1503,6 +2112,17 @@ impl AvmInterpreter {
     /// This is the main entry point for transaction validation.
     /// In default mode, calls core-logic's execute_core directly.
     pub fn execute(&self, inputs: PublicInputs) -> Result<PublicOutputs, AvmError> {
+        self.execute_impl(inputs, false)
+    }
+
+    /// `execute` for an execution whose result the caller RECORDS in its
+    /// transaction DB (Lambda: the CL5 redeem). Only these join the YPX-009
+    /// audit chain — see `pulse_post_execute`.
+    pub fn execute_audited(&self, inputs: PublicInputs) -> Result<PublicOutputs, AvmError> {
+        self.execute_impl(inputs, true)
+    }
+
+    fn execute_impl(&self, inputs: PublicInputs, accumulate: bool) -> Result<PublicOutputs, AvmError> {
         // YPX-009 pulse-gate: reject if calibration not complete
         if !self.is_pulse_ready() {
             return Err(AvmError::PulseNotReady);
@@ -1525,10 +2145,10 @@ impl AvmInterpreter {
                 let inputs_ref = inputs.clone();
                 let result = self.execute_riscv(inputs)?;
                 // §23.14: Track new audit demands (post-execution)
-                self.enforce_audit_post(&result.outputs);
+                self.enforce_audit_post(&inputs_ref, &result.outputs, accumulate);
                 // YPX-009: Silicon Pulse post-execution (no DMAP trace in execute())
                 let mut outputs = result.outputs;
-                self.pulse_post_execute(&inputs_ref, &mut outputs, None);
+                self.pulse_post_execute(&inputs_ref, &mut outputs, None, accumulate);
                 return Ok(outputs);
             }
             // Fall through to native execution (Cargo feature unification case:
@@ -1536,13 +2156,13 @@ impl AvmInterpreter {
         }
 
         // Direct native execution
-        let _host = HostFunctions::new(0, self.runtime_fingerprint);
+        let _host = HostFunctions::new();
         let inputs_ref = inputs.clone(); // keep a copy for pulse processing
         let mut outputs = execute_core(inputs);
         // §23.14: Track new audit demands (post-execution)
-        self.enforce_audit_post(&outputs);
+        self.enforce_audit_post(&inputs_ref, &outputs, accumulate);
         // YPX-009: Silicon Pulse post-execution (no DMAP trace in native mode)
-        self.pulse_post_execute(&inputs_ref, &mut outputs, None);
+        self.pulse_post_execute(&inputs_ref, &mut outputs, None, accumulate);
         Ok(outputs)
     }
 
@@ -1552,6 +2172,16 @@ impl AvmInterpreter {
     /// returns outputs with no DMAP trace (native execution cannot produce
     /// memory checkpoints).
     pub fn execute_with_dmap(&self, inputs: PublicInputs) -> Result<AvmExecutionResult, AvmError> {
+        self.execute_with_dmap_impl(inputs, false)
+    }
+
+    /// `execute_with_dmap` for the execution Lambda RECORDS — the FINALIZING
+    /// CL3 (last hop). Non-final hops use the plain entry point.
+    pub fn execute_with_dmap_audited(&self, inputs: PublicInputs) -> Result<AvmExecutionResult, AvmError> {
+        self.execute_with_dmap_impl(inputs, true)
+    }
+
+    fn execute_with_dmap_impl(&self, inputs: PublicInputs, accumulate: bool) -> Result<AvmExecutionResult, AvmError> {
         // YPX-009 pulse-gate: reject if calibration not complete
         if !self.is_pulse_ready() {
             return Err(AvmError::PulseNotReady);
@@ -1573,22 +2203,22 @@ impl AvmInterpreter {
                 let inputs_ref = inputs.clone();
                 let mut result = self.execute_riscv(inputs)?;
                 // §23.14: Track new audit demands (post-execution)
-                self.enforce_audit_post(&result.outputs);
+                self.enforce_audit_post(&inputs_ref, &result.outputs, accumulate);
                 // YPX-009: Silicon Pulse with DMAP trace
-                self.pulse_post_execute(&inputs_ref, &mut result.outputs, result.dmap_trace.as_ref());
+                self.pulse_post_execute(&inputs_ref, &mut result.outputs, result.dmap_trace.as_ref(), accumulate);
                 return Ok(result);
             }
             // Fall through to native (no DMAP trace without real ELF)
         }
 
         // Native execution — no DMAP trace available
-        let _host = HostFunctions::new(0, self.runtime_fingerprint);
+        let _host = HostFunctions::new();
         let inputs_ref = inputs.clone();
         let mut outputs = execute_core(inputs);
         // §23.14: Track new audit demands (post-execution)
-        self.enforce_audit_post(&outputs);
+        self.enforce_audit_post(&inputs_ref, &outputs, accumulate);
         // YPX-009: Silicon Pulse post-execution (no DMAP trace in native mode)
-        self.pulse_post_execute(&inputs_ref, &mut outputs, None);
+        self.pulse_post_execute(&inputs_ref, &mut outputs, None, accumulate);
         Ok(AvmExecutionResult {
             outputs,
             dmap_trace: None,
@@ -1623,7 +2253,7 @@ impl AvmInterpreter {
         }
 
         // 2. Create FastCpu with host functions + reuse guest memory
-        let host = HostFunctions::new(0, self.runtime_fingerprint);
+        let host = HostFunctions::new();
         thread_local! {
             static CACHED_MEMORY: std::cell::RefCell<Option<crate::riscv::GuestMemory>> = const { std::cell::RefCell::new(None) };
         }
@@ -1821,8 +2451,20 @@ mod tests {
             .expect("Failed to generate wallet ID");
 
         PublicInputs {
+            zkq_request: None,
+            fact_certificates: Vec::new(),
+            fob_claim_attestation: None,
+            receiver_witness: None,
+            receiver_signing_key: None,
             oods_attestation: None,
             recall_attestation: None,
+            // §5.2.2b/c — a plain CL1 fixture is not a subsidy claim: no
+            // claimant certificate to present, and no stake lock held.
+            claimant_vbc: None,
+            receiver_current_wall_clock_lock: None,
+            receiver_current_emission_claimed_epoch: None,
+            receiver_current_stake_floor_until: None,
+            receiver_current_wallet_format: None,
             mode: CoreLogicMode::CL1,
             transaction: Transaction {
                 consumed_state_id: [0u8; 32],
@@ -1837,7 +2479,6 @@ mod tests {
                 nonce: 1,
                 epoch: 1,
                 client_sig: vec![0u8; 64],
-                owner_proof: None,
                 scar_passcode: None,
                 burn_target_tx_id: None,
                 required_k: 0,
@@ -1857,6 +2498,9 @@ mod tests {
                 wallet_id: None,
                 group_members: None,
                 hibernation_until: 0,
+                wall_clock_lock: 0,
+                emission_claimed_epoch: 0,
+                stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             }),
             vbc_bundle: None,
             cheque_bundle: None,
@@ -1881,12 +2525,8 @@ mod tests {
             audit_confirmation: None,
             nonce_response: None,
             audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
             wallet_secret: None,
             fanout_message: None,
-            candidate_balance: None,
             nabla_stake_proof: None,
             frozen_wallets: None,
             console_current_cert: None,
@@ -1900,7 +2540,6 @@ mod tests {
             phase_out_blocked_era_ids: vec![],
             current_tick: 0,
             local_core_id: [0u8; 32],
-            withdrawal_inputs: None,
             max_fact_links: None,
         
         }
@@ -1968,19 +2607,158 @@ mod tests {
         use super::*;
 
         /// Find the compiled AVM guest ELF.
-        /// Looks relative to workspace root: core/avm-guest/target/riscv32im-unknown-none-elf/release/axiom-avm-guest
+        /// Tries, in order:
+        ///   1. Monorepo layout, relative to workspace root:
+        ///      core/avm-guest/target/riscv32im-unknown-none-elf/release/axiom-avm-guest
+        ///   2. Public-repo layout (core/* flattened to the repo root):
+        ///      avm-guest/target/riscv32im-unknown-none-elf/release/axiom-avm-guest
+        ///   3. `AXIOM_GUEST_ELF` env var — explicit override, full path to the
+        ///      guest ELF (consulted only when neither layout has one, so a
+        ///      committed checkout's own artifact stays authoritative).
         pub fn find_elf() -> Option<Vec<u8>> {
             // Walk up from CARGO_MANIFEST_DIR to find workspace root
             let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            // core/avm/.. = core/, core/.. = src/ (workspace root)
-            let workspace = manifest_dir.parent()?.parent()?;
-            let elf_path = workspace
-                .join("core/avm-guest/target/riscv32im-unknown-none-elf/release/axiom-avm-guest");
-            if elf_path.exists() {
-                Some(std::fs::read(&elf_path).expect("Failed to read ELF"))
-            } else {
-                None
+            // 1. Monorepo: core/avm/.. = core/, core/.. = src/ (workspace root)
+            if let Some(workspace) = manifest_dir.parent().and_then(|p| p.parent()) {
+                let elf_path = workspace
+                    .join("core/avm-guest/target/riscv32im-unknown-none-elf/release/axiom-avm-guest");
+                if elf_path.exists() {
+                    return Some(std::fs::read(&elf_path).expect("Failed to read ELF"));
+                }
             }
+            // 2. Public repo: core/* is flattened, so avm/.. = repo root
+            if let Some(repo_root) = manifest_dir.parent() {
+                let elf_path = repo_root
+                    .join("avm-guest/target/riscv32im-unknown-none-elf/release/axiom-avm-guest");
+                if elf_path.exists() {
+                    return Some(std::fs::read(&elf_path).expect("Failed to read ELF"));
+                }
+            }
+            // 3. Explicit override for any other layout
+            if let Ok(p) = std::env::var("AXIOM_GUEST_ELF") {
+                let elf_path = std::path::PathBuf::from(p);
+                if elf_path.exists() {
+                    return Some(std::fs::read(&elf_path).expect("Failed to read ELF"));
+                }
+            }
+            None
+        }
+
+        /// Skip-as-green canary. Every differential test in this file returns
+        /// early (green) when the guest ELF is absent, so a checkout that never
+        /// built the guest reports a passing suite while 16 differential tests
+        /// silently do nothing. This test makes that skip a VISIBLE CHOICE:
+        /// it passes when the ELF is found, or when the operator explicitly
+        /// opts in with AXIOM_ALLOW_GUEST_SKIP=1 — and FAILS otherwise.
+        #[test]
+        fn differential_guest_elf_presence_canary() {
+            if find_elf().is_some() {
+                return; // guest ELF present — the differential tests really run
+            }
+            eprintln!("SKIP: axiom-core.elf not found — 16 differential tests in this file are skipping");
+            if std::env::var("AXIOM_ALLOW_GUEST_SKIP").as_deref() == Ok("1") {
+                eprintln!("AXIOM_ALLOW_GUEST_SKIP=1 — skip acknowledged, canary passes");
+                return;
+            }
+            panic!(
+                "16 differential tests are silently skipping — build the guest ELF \
+                 (cd core/avm-guest && cargo build --release --target riscv32im-unknown-none-elf, \
+                 or avm-guest/ on the public layout, or point AXIOM_GUEST_ELF at one) \
+                 or set AXIOM_ALLOW_GUEST_SKIP=1"
+            );
+        }
+
+        /// P3.7 guest/host discriminator — a CHARGE-shaped CL5 (k≥3 sender →
+        /// k=0 receiver, no Nabla artifacts) must reject IDENTICALLY in the
+        /// guest and natively. Built while chasing the live 938ae779 charge
+        /// redeem rejecting `InvalidWalletId` in the SDK's guest CL5 run: if
+        /// guest and native diverge here, the wallet_id checks behave
+        /// differently in-guest.
+        #[test]
+        fn test_real_elf_cl5_charge_shape_guest_matches_native() {
+            use axiom_core_logic::wallet_id::{
+                generate_wallet_id_full, generate_all_wallet_ids, K_ARK, WALLET_IDENTITY_KEY,
+            };
+            let elf = match find_elf() {
+                Some(e) => e,
+                None => {
+                    eprintln!("SKIP: axiom-core.elf not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
+                    return;
+                }
+            };
+            use ed25519_dalek::{Signer, SigningKey};
+            let sender_sk = SigningKey::from_bytes(&[0x61u8; 32]);
+            let receiver_sk = SigningKey::from_bytes(&[0x62u8; 32]);
+            let spk = sender_sk.verifying_key().to_bytes();
+            let rpk = receiver_sk.verifying_key().to_bytes();
+            let salt_r = hex::encode(blake3::hash(&rpk).as_bytes())[..2].to_string();
+            let r_addr = generate_wallet_id_full(
+                "chargepair@axiom", &salt_r, &WALLET_IDENTITY_KEY, &rpk, K_ARK,
+                axiom_core_logic::wallet_id::PROOF_TYPE_ARK,
+            ).unwrap();
+            let s_addr = generate_all_wallet_ids("chargesender@axiom", "42", &spk).unwrap()
+                .into_iter().find(|(_, k, _, _)| *k == 3).map(|(a, _, _, _)| a).unwrap();
+
+            let mut tx = create_test_inputs().transaction;
+            tx.sender_wallet_id = s_addr.clone();
+            tx.receiver_wallet_id = r_addr.clone();
+            tx.client_pk = spk.to_vec();
+            tx.amount = 3_000_000_000;
+            let mut cheque_tx = tx.clone();
+            cheque_tx.receiver_wallet_id = r_addr.clone();
+            let txid = axiom_core_logic::compute::compute_txid(&cheque_tx);
+            let issuer = axiom_core_logic::cheque_build::ChequeIssuerContext {
+                issuer_id: *blake3::hash(&spk).as_bytes(),
+                issuer_pk: spk.to_vec(),
+                vbc_bundle: None,
+                carrier_type: "email".to_string(),
+                carrier_address: String::new(),
+                rate_bps: 0,
+                created_at: 1000,
+            };
+            let mut cheque = axiom_core_logic::cheque_build::build_cheque_unsigned(
+                &cheque_tx, txid, [0u8; 32], [1u8; 32], None,
+                b"", None, 1, [0u8; 32], [0u8; 32], None, None, Vec::new(), &issuer,
+            );
+            let commitment = axiom_core_logic::compute::compute_cheque_commitment(
+                &cheque.txid, &cheque.state_hash, &cheque.produced_state_id,
+                // §5.2.2c — `sender_wallet_id` became SIGNED on 2026-09-05 and
+                // sits BEFORE the receiver in the pre-image. Read both off the
+                // cheque so this fixture cannot drift from the builder.
+                &cheque.sender_wallet_id, &cheque.receiver_wallet_id,
+                cheque.amount, cheque.epoch, cheque.created_at, cheque.rate_bps,
+                &cheque.dmap_input_hash, &cheque.dmap_output_hash,
+                cheque.oracle_claim.as_ref(), cheque.recall_target_tx_id.as_ref(),
+            );
+            cheque.signature = sender_sk.sign(&commitment).to_bytes().to_vec();
+            // 3 cheques from "distinct validators" (charge required_k = 3).
+            let mut cheques = Vec::new();
+            for i in 0..3u8 {
+                let mut c = cheque.clone();
+                c.validator_id = [i + 1; 32];
+                cheques.push(c);
+            }
+            let bundle = axiom_core_logic::types::ChequeBundle { cheques, fact_chain: None };
+            let state_id = axiom_core_logic::genesis::compute_genesis_state_id(
+                &rpk, 0, K_ARK, axiom_core_logic::wallet_id::PROOF_TYPE_ARK,
+            );
+            let inputs = axiom_core_logic::cl5_inputs::build_cl5_attestation_inputs(
+                // (balance, seq, hibernation, wall_clock_lock, emission_claimed_epoch,
+                // stake_floor_until) all 0, current format block — this fixture
+                // exercises the interpreter, not the §5.2.2c / §6b.13 gates.
+                &rpk, &bundle, 0, 0, 0, 0, 0, 0, axiom_core_logic::types::WalletFormat::CURRENT,
+                state_id, Vec::new(), None, None, None, [0u8; 32],
+            );
+
+            let native = axiom_core_logic::execute_core(inputs.clone());
+            let avm = AvmInterpreter::new(elf, [0u8; 32]);
+            let guest = avm.execute(inputs).expect("guest execution failed");
+            eprintln!("charge-shape CL5: native={:?} guest={:?}",
+                native.rejection_reason, guest.rejection_reason);
+            assert_eq!(guest.result, native.result);
+            assert_eq!(guest.rejection_reason, native.rejection_reason,
+                "guest and native CL5 must reject a charge-shaped bundle identically");
         }
 
         #[test]
@@ -1989,6 +2767,7 @@ mod tests {
                 Some(e) => e,
                 None => {
                     eprintln!("SKIP: axiom-core.elf not found — build with: cd core/avm-guest && cargo build --release");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
                     return;
                 }
             };
@@ -2023,6 +2802,7 @@ mod tests {
                 Some(e) => e,
                 None => {
                     eprintln!("SKIP: axiom-core.elf not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
                     return;
                 }
             };
@@ -2034,6 +2814,11 @@ mod tests {
             // Add receipt with VBC bundle
             let receipt = Receipt {
                 oods_flag: None,
+                confidence_index: None,
+                // §32.3 received-from lineage (38a8cdd6, 2026-08-11) — third
+                // fixture that commit left behind, alongside the two in
+                // core/ipc/src/codec.rs. Not a recall/redeem receipt here.
+                sender_state: None,
                 txid: [1u8; 32],
                 state_hash: [2u8; 32],
                 produced_state_id: [3u8; 32],
@@ -2060,6 +2845,11 @@ mod tests {
                     vbc_bundle: Some(VBCProofBundle {
                         target_vbc: VBC {
                             version: 9,
+                            // §5.3 — depth-0 fixtures: zero is the genesis /
+                            // no-lineage sentinel, which is what a chain_depth 0
+                            // certificate legitimately carries.
+                            genesis_lineage: [0u8; 32],
+                            nabla_registration: None,
                             network_size_baseline: 0,
                             baseline_tick: 0,
                             validator_id: [7u8; 32],
@@ -2078,6 +2868,8 @@ mod tests {
                             founding_vbc_hash: [17u8; 32],
                         },
                         supporting_vbcs: vec![],
+                        candidacy_pulse: None,
+                        renewal_work_receipt: None,
                     }),
                     fact_signature: None,
                     checkpoint_sig: None,
@@ -2104,6 +2896,7 @@ mod tests {
                 Some(e) => e,
                 None => {
                     eprintln!("SKIP: axiom-core.elf not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
                     return;
                 }
             };
@@ -2132,7 +2925,11 @@ mod tests {
         fn test_real_elf_interior_checkpoints_fire() {
             let elf = match find_elf() {
                 Some(e) => e,
-                None => { eprintln!("SKIP: axiom-core.elf not found"); return; }
+                None => {
+                    eprintln!("SKIP: axiom-core.elf not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
+                    return;
+                }
             };
             let avm = AvmInterpreter::new(elf, [0u8; 32]);
             let result = avm.execute_with_dmap(create_test_inputs()).expect("DMAP execution failed");
@@ -2168,6 +2965,7 @@ mod tests {
                 Some(e) => e,
                 None => {
                     eprintln!("SKIP: axiom-core.elf not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
                     return;
                 }
             };
@@ -2208,19 +3006,9 @@ mod tests {
         use super::*;
 
         fn make_avm() -> AvmInterpreter {
-            // Bypass calibration for test speed (no 200ms delay per test)
-            let avm = AvmInterpreter {
-                bytecode: vec![0x00],
-                runtime_fingerprint: [0u8; 32],
-                pending_audit: Mutex::new(None),
-                peer_audit_bans: Mutex::new(Vec::new()),
-                audit_buffer: Mutex::new(AuditBuffer::new()),
-                wallet_cache: Mutex::new(WalletCache::new()),
-                validator_pk: Mutex::new(None),
-                pulse_ready: AtomicBool::new(true), // tests bypass gate
-                ignition_t0: Mutex::new(None),
-                last_validated_tick: AtomicU64::new(0),
-            };
+            // No calibration (test speed); the gate is bypassed. One assembly
+            // path with `new()` — never a struct literal here (RULE 1).
+            let avm = AvmInterpreter::new_uncalibrated(vec![0x00], [0u8; 32], true);
             avm.set_validator_pk(vec![0xAAu8; 32]);
             avm
         }
@@ -2251,12 +3039,32 @@ mod tests {
             assert!(avm.is_validator_banned(&banned_pk), "ban active at imposition tick");
             assert_eq!(avm.peer_audit_bans().len(), 1);
             assert_eq!(avm.peer_audit_bans()[0].banned_at_tick, t, "ban stamped with validated tick, not wall clock");
+            assert_eq!(avm.audit_operator_counts().2, 1, "dashboard: bans issued is counted");
+            avm.ban_validator(banned_pk.clone(), axiom_core_logic::types::PeerAuditBanReason::NonResponds);
+            assert_eq!(avm.peer_audit_bans().len(), 1, "a re-ban updates the live entry");
+            assert_eq!(avm.audit_operator_counts().2, 2, "…but bans ISSUED is cumulative (a ban lifts; the count stays)");
 
             // PEER_AUDIT_BAN_TICKS is a tick COUNT; the stamp window is the
-            // count projected onto unix-second tick stamps (24h = 86400).
+            // count projected onto unix-second tick stamps: 24 h = 86 400 on a
+            // real build, 1 h = 3 600 on a dev-mode build (peer_audit_ban_ticks_dev
+            // = 720, YP §23.14 item 7, 2026-09-26).
             let window_stamp = axiom_core_logic::types::PEER_AUDIT_BAN_TICKS
                 * axiom_core_logic::types::TICK_INTERVAL_SECS;
-            assert_eq!(window_stamp, 86_400, "24h ban window on the stamp scale");
+            // Which one applies is core-logic's `dev-mode`, pinned per build by
+            // core/logic/tests/peer_audit_ban_dev_twin.rs; this crate's own
+            // `dev-mode` need not match it, so accept exactly the two values.
+            assert!(matches!(window_stamp, 3_600 | 86_400),
+                    "ban window on the stamp scale must be 1 h (dev) or 24 h (real), got {window_stamp}");
+            // The wording every ban message uses comes from the SAME window —
+            // it said a hardcoded "24 hours" on dev builds (1 h) until 2026-09-26.
+            assert_eq!(super::super::peer_audit_ban_window_secs(), window_stamp);
+            let text = super::super::peer_audit_ban_duration_text();
+            assert_eq!(text, if window_stamp == 3_600 { "1 h" } else { "24 h" });
+            let msg = AvmError::ValidatorBanned {
+                validator_pk: banned_pk.clone(),
+                reason: axiom_core_logic::types::PeerAuditBanReason::HashMismatch,
+            }.to_string();
+            assert!(msg.contains(&format!("expires after {text}")), "rejection text states the real window: {msg}");
 
             // One second before the window closes — still banned.
             avm.last_validated_tick.store(t + window_stamp - 1, Ordering::Release);
@@ -2275,6 +3083,489 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
+        }
+
+        // ── §23.14.1 peer-audit TIME-BOND ─────────────────────────────────
+
+        use axiom_core_logic::types::{
+            AuditDemand, NablaOodsAttestation, Receipt, WitnessSig, AUDIT_MAX_TICK_GAP,
+        };
+
+        /// A prev-receipt witnessed by `peer_pk` — the guest/host read only
+        /// `witness_sigs[].validator_pk` for audit target selection.
+        fn peer_receipt(peer_pk: Vec<u8>) -> Receipt {
+            Receipt {
+                oods_flag: None,
+                confidence_index: None,
+                sender_state: None,
+                txid: [1u8; 32],
+                state_hash: [2u8; 32],
+                produced_state_id: [3u8; 32],
+                new_wallet_seq: 1,
+                commitment_hash: [0u8; 32],
+                sdid: [0u8; 32],
+                lineage_hash: [0u8; 32],
+                core_version: String::new(),
+                epoch: 0,
+                fact_proof: None,
+                required_k: 3,
+                receipt_commitment: [0u8; 32],
+                fee_breakdown: Vec::new(),
+                is_dev_class: false,
+                core_id: [0u8; 32],
+                witness_sigs: vec![WitnessSig {
+                    validator_id: [4u8; 32],
+                    validator_pk: peer_pk,
+                    vbc_bundle: None,
+                    carrier_type: "email".into(),
+                    carrier_address: "test@axiom.local".into(),
+                    signature: vec![6u8; 64],
+                    execution_proof: vec![],
+                    proof_type: 1,
+                    availability_attestation: None,
+                    validator_hints: vec![],
+                    fact_signature: None,
+                    checkpoint_sig: None,
+                    receipt_signature: None,
+                    receipt_commitment_sig: None,
+                    rate_bps: 0,
+                    slot_amount: 0,
+                }],
+            }
+        }
+
+        /// A minimal-but-real oods attestation carrying `tick` (only the tick is
+        /// read by the time-bond; enforce_audit_post runs post-Accept so the
+        /// signature was already verified upstream — the fixture is not re-verified).
+        fn oods_at(tick: u64) -> NablaOodsAttestation {
+            NablaOodsAttestation {
+                oods_size: 1,
+                tick,
+                baseline_size: 0,
+                baseline_tick: 0,
+                nabla_node_pk: [0u8; 32],
+                nabla_signature: vec![],
+                nbc_issuer_pk: vec![],
+                nbc_signature: vec![],
+                nbc_commitment: vec![],
+            }
+        }
+
+        /// A finalizing CL3 input at `attested_tick`, CO-witnessed by `peer_pk`
+        /// (its signature in `overlapped_signatures` — the §23.14.2 target set since
+        /// KI#213; it is also left in `prev_receipts` so a regression to the old
+        /// previous-witness selection would still find a pk and the tests below
+        /// judge WHICH set was read). `attested_tick = None` ⇒ no attestation.
+        fn witnessed_inputs(attested_tick: Option<u64>, peer_pk: Vec<u8>) -> PublicInputs {
+            let mut inputs = create_test_inputs();
+            inputs.mode = CoreLogicMode::CL3;
+            inputs.prev_receipts = vec![peer_receipt(vec![0xEEu8; 32])];
+            inputs.overlapped_signatures = peer_receipt(peer_pk).witness_sigs;
+            inputs.oods_attestation = attested_tick.map(oods_at);
+            inputs
+        }
+
+        /// An Accept CL3 output carrying `txid`, with `audit_demand` (the guest
+        /// volume trigger) set or not. Everything else empty.
+        fn accept_outputs(txid: Option<[u8; 32]>, audit_demand: Option<AuditDemand>) -> PublicOutputs {
+            PublicOutputs {
+                zkp_qualification: None,
+                result: ValidationResult::Accept,
+                new_state_hash: None,
+                produced_state_id: None,
+                new_wallet_seq: None,
+                rejection_reason: None,
+                is_overlapped: None,
+                commitment_hash: None,
+                txid,
+                fact_signature: None,
+                new_balance: None,
+                nbc_signature: None,
+                zkp_nonce_hash: None,
+                compressed_fact_chain: None,
+                ark_send_fact_chain: None,
+                receiver_fact_chain: None,
+                required_k: 3,
+                extracted_proof_type: 0,
+                audit_demand,
+                audit_request: None,
+                nonce_challenge: None,
+                pulse_proof: None,
+                audit_failed: false,
+                fanout_new_ttl: None,
+                console_chain_hash: None,
+                receipt_commitment: None,
+                is_dev_class: None,
+                oods_flag: None,
+                confidence_index: None,
+                sender_state: None,
+                hibernation_until: 0,
+                wall_clock_lock: 0,
+                emission_claimed_epoch: 0,
+                stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
+            }
+        }
+
+        /// The time-bond fires a peer audit after AUDIT_MAX_TICK_GAP ticks even
+        /// with NO volume trigger, and stamps the clock with the attested tick.
+        #[test]
+        fn time_bond_fires_after_gap_with_no_volume_trigger() {
+            let avm = make_avm(); // validator_pk = 0xAA…
+            let peer = vec![0xBBu8; 32];
+            // Just past the gap; last demand tick starts at 0.
+            let tick = AUDIT_MAX_TICK_GAP + 1;
+            let inputs = witnessed_inputs(Some(tick), peer.clone());
+            let outputs = accept_outputs(Some([9u8; 32]), None); // no volume demand
+
+            assert!(avm.pending_audit.lock().unwrap().is_none());
+            avm.enforce_audit_post(&inputs, &outputs, true);
+
+            let pending = avm.pending_audit.lock().unwrap();
+            let audit = pending.as_ref().expect("time-bond must arm a peer audit");
+            assert!(audit.is_peer, "witness is a different validator → peer audit");
+            assert_eq!(audit.demand.target_validator_pk, peer, "target = the prev-receipt witness");
+            assert_eq!(
+                avm.last_peer_audit_demand_tick.load(Ordering::Acquire),
+                tick,
+                "the clock is stamped with the attested tick that fired it",
+            );
+            drop(pending);
+            assert_eq!(avm.peer_audit_trigger_counts(), (0, 1),
+                "YP §23.14 item 10: a time-bond demand counts as time_bond, never volume");
+        }
+
+        /// YP §23.14 item 10 (2026-09-26): a guest VOLUME demand counts as
+        /// volume — so a run can tell which trigger armed each peer audit.
+        #[test]
+        fn volume_demand_counts_as_volume() {
+            let avm = make_avm();
+            let peer = vec![0xBBu8; 32];
+            let inputs = witnessed_inputs(Some(1), peer.clone()); // far below the time-bond gap
+            let demand = AuditDemand { challenge_nonce: [3u8; 32], target_validator_pk: peer, trigger_txid: [9u8; 32] };
+            let outputs = accept_outputs(Some([9u8; 32]), Some(demand));
+            avm.enforce_audit_post(&inputs, &outputs, true);
+            assert!(avm.pending_audit.lock().unwrap().as_ref().is_some_and(|a| a.is_peer));
+            assert_eq!(avm.peer_audit_trigger_counts(), (1, 0));
+        }
+
+        /// Not yet at the gap ⇒ no fire; the clock resets on a demand so it does
+        /// not re-fire until a FULL gap has passed again.
+        #[test]
+        fn time_bond_respects_the_gap_and_resets() {
+            let avm = make_avm();
+            let peer = vec![0xBBu8; 32];
+
+            // Well within the gap from tick 0 ⇒ silent.
+            let inputs = witnessed_inputs(Some(AUDIT_MAX_TICK_GAP), peer.clone()); // == gap, not > gap
+            avm.enforce_audit_post(&inputs, &accept_outputs(Some([1u8; 32]), None), true);
+            assert!(avm.pending_audit.lock().unwrap().is_none(), "at exactly the gap, not past it → silent");
+
+            // Past the gap ⇒ fires, clock = t1.
+            let t1 = AUDIT_MAX_TICK_GAP + 1;
+            avm.enforce_audit_post(&witnessed_inputs(Some(t1), peer.clone()),
+                                   &accept_outputs(Some([2u8; 32]), None), true);
+            assert!(avm.pending_audit.lock().unwrap().is_some(), "past the gap → fires");
+            // Clear the countdown as a completed/expired audit would.
+            *avm.pending_audit.lock().unwrap() = None;
+
+            // t1 + gap is NOT past the gap from t1 ⇒ silent (reset worked).
+            avm.enforce_audit_post(&witnessed_inputs(Some(t1 + AUDIT_MAX_TICK_GAP), peer.clone()),
+                                   &accept_outputs(Some([3u8; 32]), None), true);
+            assert!(avm.pending_audit.lock().unwrap().is_none(), "clock reset to t1 → no refire within a gap");
+
+            // One tick further IS past the gap from t1 ⇒ fires again.
+            avm.enforce_audit_post(&witnessed_inputs(Some(t1 + AUDIT_MAX_TICK_GAP + 1), peer.clone()),
+                                   &accept_outputs(Some([4u8; 32]), None), true);
+            assert!(avm.pending_audit.lock().unwrap().is_some(), "a full gap after the reset → fires again");
+        }
+
+        /// §23.14 (KI#210): a demand must NOT arm on a NON-audited execution. The
+        /// trigger tx is accumulated into the audit buffer ONLY when `accumulate`
+        /// (pulse_post_execute returns early otherwise), and a self-audit can be
+        /// confirmed ONLY against a buffer entry — so a demand armed on a non-audited
+        /// CL2 witness references a trigger tx that was never recorded, can never be
+        /// confirmed, and self-terminates the validator (tier C: 10 of 15 residual
+        /// self-terminates). This is red without the `if !accumulate { return }`
+        /// gate — the first assert would arm.
+        #[test]
+        fn time_bond_never_arms_on_a_non_audited_execution() {
+            let avm = make_avm();
+            let peer = vec![0xBBu8; 32];
+            let tick = AUDIT_MAX_TICK_GAP + 1; // well past the gap → would arm if audited
+            avm.enforce_audit_post(&witnessed_inputs(Some(tick), peer.clone()),
+                                   &accept_outputs(Some([5u8; 32]), None), false);
+            assert!(avm.pending_audit.lock().unwrap().is_none(),
+                    "a non-audited execution must NOT arm — its trigger tx is not in the buffer");
+            // The SAME round on an AUDITED execution DOES arm — proving the gate,
+            // not the tick logic, is what blocked it.
+            avm.enforce_audit_post(&witnessed_inputs(Some(tick), peer.clone()),
+                                   &accept_outputs(Some([5u8; 32]), None), true);
+            assert!(avm.pending_audit.lock().unwrap().is_some(),
+                    "the same round on an audited execution arms");
+        }
+
+        /// No attested tick on the round ⇒ the time-bond cannot judge elapsed
+        /// protocol time ⇒ it stays silent (never wall clock, never tx.epoch).
+        #[test]
+        fn time_bond_silent_without_attested_tick() {
+            let avm = make_avm();
+            let peer = vec![0xBBu8; 32];
+            // Huge tx.epoch but NO oods attestation → no attested tick.
+            let mut inputs = witnessed_inputs(None, peer);
+            inputs.transaction.epoch = AUDIT_MAX_TICK_GAP + 10_000;
+            avm.enforce_audit_post(&inputs, &accept_outputs(Some([1u8; 32]), None), true);
+            assert!(avm.pending_audit.lock().unwrap().is_none(), "no attested tick → no time-bond");
+        }
+
+        /// The AVM exposes the pending peer-audit DEMAND (with target) so Lambda can
+        /// mirror a TIME-BOND demand into its own pending and actually SEND the request
+        /// (else a time-bond audit falsely bans NonResponds with no request sent).
+        #[test]
+        fn pending_peer_audit_demand_exposes_the_target() {
+            let avm = make_avm();
+            let target = vec![0xBBu8; 32];
+            // Arm a peer audit as enforce_audit_post would (peer + expected hash set).
+            *avm.pending_audit.lock().unwrap() = Some(PendingAudit {
+                demand: AuditDemand {
+                    challenge_nonce: [1u8; 32],
+                    target_validator_pk: target.clone(),
+                    trigger_txid: [2u8; 32],
+                },
+                remaining: 100,
+                trigger_tx_number: 0,
+                is_peer: true,
+                dispatched_at_tick: None,
+                peer_expected_hash: Some([3u8; 32]),
+                dispatched: false,
+                self_expected_digest: None,
+            });
+            let d = avm.pending_peer_audit_demand().expect("peer demand present");
+            assert_eq!(d.target_validator_pk, target, "Lambda reads the target from here to send");
+            assert!(avm.pending_peer_audit_request().is_some(), "request also available");
+            // The mirror accessor surfaces a PEER demand too (peer path unchanged).
+            assert_eq!(
+                avm.pending_time_bond_demand().expect("peer demand surfaces for the mirror")
+                    .target_validator_pk,
+                target,
+            );
+            // A self-audit (is_peer=false) must NOT surface as a peer demand.
+            avm.pending_audit.lock().unwrap().as_mut().unwrap().is_peer = false;
+            assert!(avm.pending_peer_audit_demand().is_none(), "self-audit is not a peer demand");
+            // …but it MUST surface via pending_time_bond_demand, or a time-bond
+            // SELF-audit is mirrored to Lambda by NEITHER path (the guest volume
+            // trigger is dev-gated out), Lambda's resolve_audit_confirmation finds
+            // nothing to confirm, and the AVM countdown SELF-TERMINATES the
+            // validator (KI#210/#207, live 2026-09-23). This assertion is red
+            // without pending_time_bond_demand.
+            assert_eq!(
+                avm.pending_time_bond_demand().expect("self-audit demand surfaces for the mirror")
+                    .target_validator_pk,
+                target, "the self-audit must be mirrorable so Lambda can build its confirmation",
+            );
+        }
+
+        /// Arm a PEER audit on `target` exactly as `enforce_audit_post` would,
+        /// with the given countdown / dispatch state.
+        fn arm_peer_audit(avm: &AvmInterpreter, target: &[u8], remaining: u8,
+                          dispatched: bool, dispatched_at_tick: Option<u64>) {
+            *avm.pending_audit.lock().unwrap() = Some(PendingAudit {
+                demand: AuditDemand {
+                    challenge_nonce: [1u8; 32],
+                    target_validator_pk: target.to_vec(),
+                    trigger_txid: [2u8; 32],
+                },
+                remaining,
+                trigger_tx_number: 0,
+                is_peer: true,
+                dispatched_at_tick,
+                peer_expected_hash: Some([3u8; 32]),
+                dispatched,
+                self_expected_digest: None,
+            });
+        }
+
+        /// §23.14 silence ruling, 2026-09-24: a peer-audit demand whose request
+        /// Lambda NEVER DISPATCHED must not ban the target. Live (tier C on
+        /// `ab98b539`) the target lookup could never match (KI#207), so every
+        /// demand expired undispatched and 32 innocent co-witnesses were banned
+        /// `NonResponds` in one run. Undispatched expiry is OUR non-compliance
+        /// (§23.14: Lambda did not initiate the audit) → `AuditTimeout`; only a
+        /// DISPATCHED request's expiry is B's attributable silence → ban.
+        /// Red on the pre-fix code (which banned in both cases) — mutation-verified
+        /// 2026-09-24: with the `dispatched` gate removed it fails "got Ok(())".
+        #[test]
+        fn undispatched_peer_audit_never_bans_the_target() {
+            let avm = make_avm();
+            let target = vec![0xBBu8; 32];
+            let other = vec![0xCCu8; 32];   // the TX's witness — not the target
+
+            // (1) countdown drained, request never sent → A's own penalty, B untouched.
+            arm_peer_audit(&avm, &target, 0, false, None);
+            let r = avm.enforce_audit_pre(&witnessed_inputs(Some(1), other.clone()));
+            assert!(matches!(r, Err(AvmError::AuditTimeout { .. })),
+                    "an undispatched peer demand expiring is Lambda's non-compliance, got {r:?}");
+            assert!(!avm.is_validator_banned(&target),
+                    "a peer that was never asked anything must not be banned NonResponds");
+
+            // (2) the SAME expiry after dispatch is B's attributable silence → ban.
+            arm_peer_audit(&avm, &target, 0, true, Some(1));
+            assert!(avm.enforce_audit_pre(&witnessed_inputs(Some(1), other.clone())).is_ok(),
+                    "a peer ban never self-terminates the innocent auditor");
+            assert!(avm.is_validator_banned(&target), "dispatched + full budget drained → NonResponds");
+            assert!(avm.pending_audit.lock().unwrap().is_none(), "the demand is cleared by the ban");
+        }
+
+        /// §23.14.3 (tick discipline, 2026-09-24): B's response deadline is
+        /// `PEER_AUDIT_TIMEOUT_TICKS` past the validated-tick WATERMARK at dispatch —
+        /// never wall clock. A stale `dispatched_at_tick` on an UNDISPATCHED audit is
+        /// ignored, `mark_peer_audit_dispatched` stamps the watermark, the ban fires
+        /// exactly at the deadline, and `unmark_peer_audit_dispatched` (the carrier
+        /// failed after hand-off) puts the audit back to undispatched so an expiry
+        /// is A's own `AuditTimeout`, never B's ban (closes the KI#211 residual).
+        #[test]
+        fn peer_audit_response_deadline_is_tick_disciplined_and_runs_from_dispatch() {
+            use axiom_core_logic::types::PEER_AUDIT_TIMEOUT_TICKS as T;
+            let avm = make_avm();
+            let target = vec![0xBBu8; 32];
+            let other = vec![0xCCu8; 32];
+            let at = |tick: u64| { let mut i = witnessed_inputs(Some(1), other.clone()); i.transaction.epoch = tick; i };
+
+            // Undispatched, with a stale stamp far in the past: no ban, countdown ticks.
+            arm_peer_audit(&avm, &target, 5, false, Some(1));
+            assert!(avm.enforce_audit_pre(&at(1_000 + T + 1)).is_ok());
+            assert!(!avm.is_validator_banned(&target), "the deadline cannot run before dispatch");
+            assert_eq!(avm.pending_audit.lock().unwrap().as_ref().unwrap().remaining, 4);
+
+            // Dispatch stamps the CURRENT watermark, not the wall clock.
+            assert!(avm.mark_peer_audit_dispatched());
+            let d0 = 1_000 + T + 1;
+            assert_eq!(avm.pending_audit.lock().unwrap().as_ref().unwrap().dispatched_at_tick, Some(d0));
+            assert!(avm.mark_peer_audit_dispatched(), "idempotent");
+            assert_eq!(avm.pending_audit.lock().unwrap().as_ref().unwrap().dispatched_at_tick, Some(d0), "not restarted");
+
+            // T−1 ticks after dispatch: still waiting. T ticks: banned.
+            assert!(avm.enforce_audit_pre(&at(d0 + T - 1)).is_ok());
+            assert!(!avm.is_validator_banned(&target), "one tick short of the deadline");
+            assert!(avm.enforce_audit_pre(&at(d0 + T)).is_ok());
+            assert!(avm.is_validator_banned(&target), "deadline reached → NonResponds");
+            assert!(avm.pending_audit.lock().unwrap().is_none());
+
+            // Carrier failure after hand-off: back to undispatched; the countdown's
+            // expiry is then OUR AuditTimeout, and the peer is never banned.
+            let target2 = vec![0xDDu8; 32];
+            arm_peer_audit(&avm, &target2, 0, true, Some(d0));
+            assert!(avm.unmark_peer_audit_dispatched(), "a dispatched peer audit is un-marked");
+            assert!(!avm.unmark_peer_audit_dispatched(), "already undispatched → false");
+            let r = avm.enforce_audit_pre(&at(d0 + 10 * T));
+            assert!(matches!(r, Err(AvmError::AuditTimeout { .. })), "expiry after a failed send is ours, got {r:?}");
+            assert!(!avm.is_validator_banned(&target2), "the peer the carrier never reached is not banned");
+
+            // A self-audit is never a dispatchable peer request.
+            arm_peer_audit(&avm, &target, 5, false, None);
+            avm.pending_audit.lock().unwrap().as_mut().unwrap().is_peer = false;
+            assert!(!avm.mark_peer_audit_dispatched(), "self-audit: nothing to dispatch");
+        }
+
+        /// SELF-audit FIXED (2026-09-24): the confirmation is judged against the
+        /// digest of the triggering execution, fixed at arming — with an EMPTY
+        /// ring (the pulse audit resets it after every accepted tx). Red on the
+        /// old ring lookup: with no entry the content check returned false and
+        /// the countdown self-terminated. Also: a wrong-field confirmation is
+        /// still refused (the check can fail).
+        #[test]
+        fn self_audit_confirmation_is_judged_against_this_executions_digest_after_a_ring_reset() {
+            let avm = make_avm();                     // our pk = [0xAA; 32]
+            let me = vec![0xAAu8; 32];
+            let txid = [0x33u8; 32];
+            let demand = AuditDemand { challenge_nonce: [4u8; 32], target_validator_pk: me.clone(), trigger_txid: txid };
+            let mut inputs = witnessed_inputs(Some(42), vec![0xBBu8; 32]);
+            inputs.transaction.amount = 250_000;
+            let mut outputs = accept_outputs(Some(txid), Some(demand.clone()));
+            outputs.produced_state_id = Some([0x44u8; 32]);
+            assert!(avm.audit_buffer.lock().unwrap().entries.is_empty(), "precondition: ring empty (as after a reset)");
+            avm.enforce_audit_post(&inputs, &outputs, true);
+            {
+                let p = avm.pending_audit.lock().unwrap();
+                let a = p.as_ref().expect("self demand armed");
+                assert!(!a.is_peer, "target == our pk ⇒ SELF audit");
+                assert!(a.self_expected_digest.is_some(), "digest fixed at arming");
+            }
+            let balance = inputs.current_state.as_ref().map(|s| s.balance).unwrap_or(0);
+            // Lambda's honest confirmation: the DB record for trigger_txid.
+            let mut next = witnessed_inputs(Some(43), vec![0xBBu8; 32]);
+            next.audit_confirmation = Some(axiom_core_logic::types::AuditConfirmation {
+                challenge_nonce: [4u8; 32], target_validator_pk: me.clone(),
+                sender_balance: balance, receiver_balance: 0, state_id: [0x44u8; 32], amount: 250_000,
+            });
+            // A WRONG confirmation first: must not clear (the check can fail).
+            let mut wrong = next.clone();
+            wrong.audit_confirmation.as_mut().unwrap().amount = 250_001;
+            assert_eq!(avm.audit_operator_counts().0, 1, "dashboard: the self demand is counted when armed");
+            assert!(avm.enforce_audit_pre(&wrong).is_ok());
+            assert!(avm.pending_audit.lock().unwrap().is_some(), "tampered fields do not clear the self audit");
+            assert_eq!(avm.audit_operator_counts().1, 0, "a tampered confirmation is not a pass");
+            // The honest one clears it — with the ring still empty.
+            assert!(avm.enforce_audit_pre(&next).is_ok());
+            assert!(avm.pending_audit.lock().unwrap().is_none(), "honest confirmation verified against the arming digest");
+            assert_eq!(avm.audit_operator_counts(), (1, 1, 0), "dashboard: one self audit armed, one passed, no ban");
+        }
+
+        /// KI#214 (2026-09-24): A's expected hash for a PEER audit is the digest
+        /// of THIS execution, available the moment the demand arms — with an
+        /// EMPTY audit buffer (the pulse audit resets the ring after every
+        /// accepted tx on the dev fleet). Red on the pre-fix code, which looked
+        /// the current tx up in the ring by `tx_counter` before it was
+        /// accumulated: `None` after a reset (request never built), or the
+        /// PREVIOUS tx's digest (honest reply judged HashMismatch).
+        #[test]
+        fn peer_audit_expected_hash_is_this_executions_digest_even_with_an_empty_buffer() {
+            let avm = make_avm();
+            let peer = vec![0xBBu8; 32];
+            let txid = [9u8; 32];
+            let demand = AuditDemand { challenge_nonce: [1u8; 32], target_validator_pk: peer.clone(), trigger_txid: txid };
+            let mut inputs = witnessed_inputs(Some(42), peer.clone());
+            inputs.transaction.amount = 1_000_000;
+            let mut outputs = accept_outputs(Some(txid), Some(demand));
+            outputs.produced_state_id = Some([0x5Au8; 32]);
+            assert!(avm.audit_buffer.lock().unwrap().entries.is_empty(), "precondition: nothing accumulated yet");
+            avm.enforce_audit_post(&inputs, &outputs, true);
+            let expected = axiom_core_logic::audit::compute_peer_audit_hash(
+                &txid,
+                inputs.current_state.as_ref().map(|s| s.balance).unwrap_or(0),
+                0, &[0x5Au8; 32], 1_000_000,
+            );
+            assert_eq!(avm.pending_peer_audit_hash(), Some(expected),
+                       "the expected hash is THIS tx's digest, not a ring lookup");
+            assert!(avm.pending_peer_audit_request().is_some(),
+                    "and so the request can be built on the very next witness");
+        }
+
+        #[test]
+        fn volume_trigger_arms_and_resets_time_bond_clock() {
+            let avm = make_avm();
+            let peer = vec![0xBBu8; 32];
+            let txid = [7u8; 32];
+            // A guest demand targeting the peer (as the guest would produce).
+            let demand = AuditDemand {
+                challenge_nonce: [1u8; 32],
+                target_validator_pk: peer.clone(),
+                trigger_txid: txid,
+            };
+            // Attested tick is small (well within a gap) — the volume trigger
+            // fires regardless, and must still stamp the clock.
+            let tick = 42u64;
+            let inputs = witnessed_inputs(Some(tick), peer.clone());
+            avm.enforce_audit_post(&inputs, &accept_outputs(Some(txid), Some(demand)), true);
+
+            let pending = avm.pending_audit.lock().unwrap();
+            let audit = pending.as_ref().expect("volume trigger must arm");
+            assert!(audit.is_peer);
+            assert_eq!(audit.demand.target_validator_pk, peer);
+            assert_eq!(
+                avm.last_peer_audit_demand_tick.load(Ordering::Acquire),
+                tick,
+                "a volume audit also resets the low-volume time-bond clock",
+            );
         }
 
         #[test]
@@ -2702,7 +3993,7 @@ mod tests {
         #[test]
         fn test_accumulate_timing_argon2id() {
             // Verify accumulate timing with Argon2id memory-hard chain.
-            // Each entry does Argon2id(48MB) → BLAKE3 — intentionally heavier
+            // Each entry does Argon2id(32MB) → BLAKE3 — intentionally heavier
             // than BLAKE3-only, creating memory pressure that detects sharing.
             let mut buf = AuditBuffer::new();
             let n = 10u64; // small sample — Argon2id is intentionally expensive
@@ -2724,7 +4015,7 @@ mod tests {
             println!("  ✓ Argon2id+BLAKE3 accumulate: {} entries in {}ms ({:.1} ms/entry)",
                 n, elapsed_ms, per_entry_ms);
 
-            // Argon2id(48MB, t=1) should be under 2000ms/entry even in debug
+            // Argon2id(32MB, t=1) should be under 2000ms/entry even in debug
             assert!(per_entry_ms < 2000.0,
                 "Argon2id accumulate too slow: {:.1} ms/entry", per_entry_ms);
         }
@@ -2757,7 +4048,7 @@ mod tests {
             let phase1_ms = t0.elapsed().as_millis();
             let phase1_per_entry_ms = phase1_ms as f64 / n_entries as f64;
             println!("  ║                                                          ║");
-            println!("  ║ Phase 1: Audit buffer (Argon2id(48MB) → BLAKE3 chain)    ║");
+            println!("  ║ Phase 1: Audit buffer (Argon2id(32MB) → BLAKE3 chain)    ║");
             println!("  ║   Entries:       {:>8}                                  ║", n_entries);
             println!("  ║   Total time:    {:>8} ms                               ║", phase1_ms);
             println!("  ║   Per entry:     {:>8.1} ms                              ║", phase1_per_entry_ms);
@@ -2969,18 +4260,7 @@ mod tests {
         // ======================================================================
 
         fn make_blocked_avm() -> AvmInterpreter {
-            AvmInterpreter {
-                bytecode: vec![0x00],
-                runtime_fingerprint: [0u8; 32],
-                pending_audit: Mutex::new(None),
-                peer_audit_bans: Mutex::new(Vec::new()),
-                audit_buffer: Mutex::new(AuditBuffer::new()),
-                wallet_cache: Mutex::new(WalletCache::new()),
-                validator_pk: Mutex::new(None),
-                pulse_ready: AtomicBool::new(false),
-                ignition_t0: Mutex::new(None),
-                last_validated_tick: AtomicU64::new(0),
-            }
+            AvmInterpreter::new_uncalibrated(vec![0x00], [0u8; 32], false)
         }
 
         #[test]
@@ -3086,18 +4366,17 @@ mod tests {
         // ======================================================================
 
         #[test]
-        fn test_ignition_process_records_t0() {
+        fn test_ignition_process_bypasses_gate_and_stays_blocked() {
             let avm = make_blocked_avm();
             assert!(!avm.is_pulse_ready());
 
-            // Process ignition TX — bypasses pulse gate, records t0
+            // Process ignition TX — bypasses pulse gate
             let inputs = create_test_inputs();
             let result = avm.process_ignition(inputs);
             assert!(result.is_ok(), "ignition TX must bypass pulse gate");
 
-            // t0 should be recorded
-            let t0 = avm.ignition_t0.lock().unwrap();
-            assert!(t0.is_some(), "process_ignition must record t0");
+            // Core stays blocked until complete_ignition (no host timer — KI#125)
+            assert!(!avm.is_pulse_ready(), "process_ignition alone must not unblock Core");
         }
 
         #[test]
@@ -3135,15 +4414,9 @@ mod tests {
             assert!(!avm.is_pulse_ready(), "Core must stay blocked on empty proof");
         }
 
-        #[test]
-        fn test_ignition_rejects_without_process() {
-            let avm = make_blocked_avm();
-
-            // complete_ignition without process_ignition must fail
-            let result = avm.complete_ignition(&[0x01, 0x02]);
-            assert!(result.is_err(), "complete_ignition without process must fail");
-            assert!(!avm.is_pulse_ready());
-        }
+        // test_ignition_rejects_without_process DELETED 2026-10-03 (KI#125): the
+        // ordering it tested was enforced by the deleted host `Instant`
+        // (`ignition_t0`). Lambda's one caller always runs process → complete.
 
         #[test]
         fn test_ignition_then_execute_works() {
@@ -3199,27 +4472,27 @@ mod tests {
             let content = vec![0xAA, 0xBB, 0xCC];
             let timestamp = 1774070000u64;
 
-            let mut id_h = blake3::Hasher::new();
-            id_h.update(b"AXIOM_FANOUT_ID");
-            id_h.update(&content);
-            id_h.update(pk.as_bytes());
-            let diffusion_id: [u8; 32] = *id_h.finalize().as_bytes();
-
-            let mut sig_h = blake3::Hasher::new();
-            sig_h.update(b"AXIOM_FANOUT");
-            sig_h.update(&diffusion_id);
-            sig_h.update(&content_type.to_le_bytes());
-            sig_h.update(&content);
-            sig_h.update(&[ttl_original]);
-            sig_h.update(&[fanout]);
-            sig_h.update(&timestamp.to_le_bytes());
-            let signing_payload: [u8; 32] = *sig_h.finalize().as_bytes();
+            // THE builders (KI#55 Pattern 1) — never a test-side copy of the preimage.
+            let diffusion_id = axiom_core_logic::compute::fanout_diffusion_id(&content, pk.as_bytes());
+            let signing_payload = axiom_core_logic::compute::fanout_signing_payload(
+                &diffusion_id, content_type, &content, ttl_original, fanout, timestamp,
+            );
             let sig = sk.sign(&signing_payload);
 
             let receiver_wallet_id = generate_wallet_id("test@test.com", "42", &[0u8; 32])
                 .expect("wallet id");
 
             PublicInputs {
+                zkq_request: None,
+                fact_certificates: Vec::new(),
+                claimant_vbc: None,
+                receiver_current_wall_clock_lock: None,
+                receiver_current_emission_claimed_epoch: None,
+                receiver_current_stake_floor_until: None,
+                receiver_current_wallet_format: None,
+                fob_claim_attestation: None,
+                receiver_witness: None,
+                receiver_signing_key: None,
                 oods_attestation: None,
                 recall_attestation: None,
                 mode: CoreLogicMode::CL10,
@@ -3236,7 +4509,6 @@ mod tests {
                     nonce: 0,
                     epoch: timestamp,
                     client_sig: vec![],
-                    owner_proof: None,
                     scar_passcode: None,
                     burn_target_tx_id: None,
                     required_k: 0,
@@ -3251,6 +4523,8 @@ mod tests {
                 vbc_bundle: Some(VBCProofBundle {
                     target_vbc: VBC {
                         version: 9,
+                        genesis_lineage: [0u8; 32],
+                        nabla_registration: None,
                         network_size_baseline: 0,
                         baseline_tick: 0,
                         validator_id: [0u8; 32],
@@ -3269,6 +4543,8 @@ mod tests {
                         founding_vbc_hash: [0u8; 32],
                     },
                     supporting_vbcs: vec![],
+                    candidacy_pulse: None,
+                    renewal_work_receipt: None,
                 }),
                 cheque_bundle: None,
                 receiver_pk: None,
@@ -3292,9 +4568,6 @@ mod tests {
                 audit_confirmation: None,
                 nonce_response: None,
                 audit_response: None,
-                scar_heal_tx_id: None,
-                scar_heal_nabla_id: None,
-                scar_heal_root_hash: None,
                 wallet_secret: None,
                 fanout_message: Some(FanOutMessage {
                     diffusion_id,
@@ -3307,7 +4580,6 @@ mod tests {
                     fanout,
                     ttl_current,
                 }),
-                candidate_balance: None,
             nabla_stake_proof: None,
                 frozen_wallets: None,
             console_current_cert: None,
@@ -3321,7 +4593,6 @@ mod tests {
             phase_out_blocked_era_ids: vec![],
             current_tick: 0,
             local_core_id: [0u8; 32],
-            withdrawal_inputs: None,
             max_fact_links: None,
             
             }
@@ -3358,7 +4629,11 @@ mod tests {
         fn test_cl10_real_elf_accept() {
             let elf = match find_elf() {
                 Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
+                None => {
+                    eprintln!("SKIP: ELF not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
+                    return;
+                }
             };
             let avm = AvmInterpreter::new(elf, [0u8; 32]);
             let inputs = make_cl10_inputs(0x0001, 10, 5, 3);
@@ -3371,7 +4646,11 @@ mod tests {
         fn test_cl10_real_elf_reject_inflated_ttl() {
             let elf = match find_elf() {
                 Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
+                None => {
+                    eprintln!("SKIP: ELF not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
+                    return;
+                }
             };
             let avm = AvmInterpreter::new(elf, [0u8; 32]);
             let mut inputs = make_cl10_inputs(0x0001, 5, 5, 3);
@@ -3385,7 +4664,11 @@ mod tests {
             // Simulate 3 hops: originator(ttl=10) → hop1(ttl=9) → hop2(ttl=8) → hop3(ttl=7)
             let elf = match find_elf() {
                 Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
+                None => {
+                    eprintln!("SKIP: ELF not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
+                    return;
+                }
             };
             let avm = AvmInterpreter::new(elf, [0u8; 32]);
 
@@ -3413,7 +4696,11 @@ mod tests {
             // TTL=1 → Accept(new_ttl=0), TTL=0 → Reject
             let elf = match find_elf() {
                 Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
+                None => {
+                    eprintln!("SKIP: ELF not found");
+                    eprintln!("      (this silent skip is policed by differential_guest_elf_presence_canary)");
+                    return;
+                }
             };
             let avm = AvmInterpreter::new(elf, [0u8; 32]);
 
@@ -3431,373 +4718,109 @@ mod tests {
         }
     }
 
-    // ======================================================================
-    // CL8 Stake Tier Enforcement — AVM integration tests
-    // Verifies MVIB (Meta-Validator Inheritance Binding) through the AVM layer.
-    // Tests both native (vec![0x00] bytecode) and real RISC-V ELF execution.
-    // ======================================================================
-    #[cfg(feature = "riscv-interpreter")]
-    mod cl8_stake_tests {
-        use super::*;
-        use super::tests::riscv_elf::find_elf;
-        use axiom_core_logic::types::*;
-        use axiom_core_logic::wallet_id::generate_wallet_id;
+}
 
-        fn make_cl8_inputs(validator_id: [u8; 32], candidate_balance: u64) -> PublicInputs {
-            let receiver_wallet_id = generate_wallet_id("test@test.com", "42", &[0u8; 32])
-                .expect("wallet id");
+#[cfg(all(test, feature = "std"))]
+mod self_audit_tests {
+    //! §5.2.2e — the self-audit produces a proof Core's verifier accepts.
+    use super::*;
 
-            PublicInputs {
-                oods_attestation: None,
-                recall_attestation: None,
-                mode: CoreLogicMode::CL8,
-                transaction: Transaction {
-                    consumed_state_id: [0u8; 32],
-                    recall_target_tx_id: None,
-                    client_pk: vec![],
-                    sender_wallet_id: String::new(),
-                    wallet_seq: 0,
-                    receiver_wallet_id,
-                    receiver_address: None,
-                    amount: 0,
-                    reference: String::new(),
-                    nonce: 0,
-                    epoch: 1774070000u64,
-                    client_sig: vec![],
-                    owner_proof: None,
-                    scar_passcode: None,
-                    burn_target_tx_id: None,
-                    required_k: 0,
-                    proof_type: 0,
-                    oracle_claim: None,
-                    core_version: String::new(),
-                    kind: TxKind::Normal,
-                    core_id: [0u8; 32],
-                },
-                prev_receipts: vec![],
-                current_state: None,
-                vbc_bundle: Some(VBCProofBundle {
-                    target_vbc: VBC {
-                        version: 9,
-                        network_size_baseline: 0,
-                        baseline_tick: 0,
-                        validator_id,
-                        node_name: "mvib-test".into(),
-                        subject_pubkey_ed25519: vec![0u8; 32],
-                        subject_pubkey_sphincs: vec![0u8; 32],
-                        subject_pubkey_dilithium: vec![],
-                        pgp_fingerprint: vec![],
-                        proof_cap: "dmap".into(),
-                        issued_at: 0,
-                        expires_at: u64::MAX,
-                        chain_depth: 0,
-                        issuer_set: vec![],
-                        signatures: vec![],
-                        max_tx: 0,
-                        founding_vbc_hash: [0u8; 32],
-                    },
-                    supporting_vbcs: vec![],
-                }),
-                cheque_bundle: None,
-                receiver_pk: None,
-                receiver_current_balance: None,
-            receiver_current_hibernation: None,
-                receiver_wallet_seq: None,
-                receiver_new_balance: None,
-                receiver_new_state_id: None,
-                my_validator_pk: None,
-                overlapped_signatures: vec![],
-                group_member_index: None,
-                sender_fact_chain: None,
-            receiver_fact_chain: None,
-                my_dilithium_sk: None,
-                my_dilithium_pk: None,
-                my_validator_id: None,
-                fact_witness_sigs: vec![],
-                issuer_sphincs_sk: Some(vec![0u8; 64]), // dummy — stake check runs before signing
-                cl1_execution_proof: None,
-                zkp_nonce: None,
-                audit_confirmation: None,
-                nonce_response: None,
-                audit_response: None,
-                scar_heal_tx_id: None,
-                scar_heal_nabla_id: None,
-                scar_heal_root_hash: None,
-                wallet_secret: None,
-                fanout_message: None,
-                candidate_balance: Some(candidate_balance),
-                frozen_wallets: None,
-            console_current_cert: None,
-            console_new_cert: None,
-            console_selector_picks: None,
-            console_nominations: None, txid_attestation: None,
-        cheque_claim_proof: None,
-                nabla_stake_proof: None,
-            clara_attestation: None,
-            phase_out_payload: None,
-            phase_out_era_end_ticks: vec![],
-            phase_out_blocked_era_ids: vec![],
-            current_tick: 0,
-            local_core_id: [0u8; 32],
-            withdrawal_inputs: None,
-            max_fact_links: None,
-            
-            }
-        }
+    // ── KI#55 B2#2 (2026-10-02): ONE builder each for `AXIOM_AUDIT_SELECT` and
+    // `AXIOM_AUDIT_VERIFY`. The constants below were computed in Python from the
+    // YP Appendix layouts (`AXIOM_AUDIT_SELECT` = BLAKE3(tag ‖ accumulator ‖
+    // validator_pk); `AXIOM_AUDIT_VERIFY` = BLAKE3(tag ‖ subset_acc ‖
+    // argon2id_output); Fiat-Shamir = BLAKE3(seed ‖ round_le_u64) → u32le % total,
+    // dedup, sort), NOT from this code — so a refactor that moves one byte goes red.
 
-        // ── Native AVM tests (vec![0x00] bytecode, no ELF needed) ──
+    #[test]
+    fn audit_select_seed_kat() {
+        assert_eq!(hex::encode(audit_select_seed(&[0x11; 32], &[0x22; 32])),
+            "7900bd0130e3b6aedb7f89cf9ef8471e0fa86848cdacd062647de8b27d059f6a");
+    }
 
-        #[test]
-        fn test_cl8_native_genesis_rejects_low_stake() {
-            // Genesis validator rejects candidate with 1,000 AXC (below Tier 2's 500,000)
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 1_000);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_eq!(result.result, ValidationResult::Reject);
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "1,000 AXC below genesis tier 500,000 threshold");
-        }
+    #[test]
+    fn audit_chain_step_kat() {
+        assert_eq!(hex::encode(audit_chain_step(&[0x33; 32], &[0x44; 32])),
+            "6488f522e0902159a0d0bf80b9587c49f03f9cce12b0b162b3cf393205dbe6ba");
+    }
 
-        #[test]
-        fn test_cl8_native_genesis_rejects_tier3_balance() {
-            // Genesis validator rejects candidate with 500 AXC (Tier 3 level)
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 500);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_eq!(result.result, ValidationResult::Reject);
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "500 AXC too low for genesis approval (needs 500,000)");
-        }
+    /// Step 0 — the PROVER's seed (`generate_request`) selects exactly the indices
+    /// the Python layout predicts for accumulator `11×32`, pk `22×32`, 64 entries.
+    #[test]
+    fn audit_select_seed_matches_the_yp_layout_on_the_prover_path() {
+        let mut buf = AuditBuffer::new();
+        buf.accumulator = [0x11; 32];
+        buf.entries = (0..64u64).map(|i| TxDigest {
+            tx_number: i + 1, sender_balance: 0, receiver_balance: 0,
+            state_id: [i as u8; 32], amount: 0,
+        }).collect();
+        let req = buf.generate_request(&[0x22; 32], 0);
+        assert_eq!(req.selected_indices, vec![26, 39, 44, 47, 49, 55, 56],
+            "AXIOM_AUDIT_SELECT seed drifted from the YP layout (KAT 7900bd01…)");
+    }
 
-        #[test]
-        fn test_cl8_native_genesis_approves_tier2() {
-            // Genesis validator approves candidate with 500,000 AXC (Tier 2)
-            // Will fail at SPHINCS+ signing (dummy keys) — that's OK,
-            // we verify the stake check does NOT reject.
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 500_000);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_ne!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "500,000 AXC should pass genesis tier check");
-        }
+    /// Step 0 — end-to-end prover/verifier agreement pinned to bytes produced by the
+    /// PRE-consolidation code (captured 2026-10-02 before the refactor): the
+    /// self-audit chain (seed + Argon2id→`AXIOM_AUDIT_VERIFY` chain) for a fixed
+    /// key/tick, and the issuer's replay of it. Production Argon2id cost only.
+    #[cfg(not(feature = "light-audit"))]
+    #[test]
+    fn audit_chain_is_byte_identical_to_the_pre_consolidation_code() {
+        let pk = [0x22u8; 32];
+        let p = self_audit_pulse(&pk, 1_000, 20);
+        assert_eq!(p.sample_size, 2);
+        assert_eq!(hex::encode(p.full_accumulator), "8e02d14fdcb38a4aeba0ef429438bc4fe1295cecf0328c0550371df25b47aefc");
+        assert_eq!(hex::encode(p.audit_hash), "7501899f8d21324277c769b9c9e06689d23ebd215b3850e27e9acb98cf9cb087");
+        assert_eq!(verify_self_audit_sample(&pk, 1_000, 20, 2, &p.full_accumulator, &p.audit_hash), Ok(()));
+    }
 
-        #[test]
-        fn test_cl8_native_genesis_rejects_just_below_tier2() {
-            // Genesis validator rejects candidate with 499,999 AXC (one below threshold)
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 499_999);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_eq!(result.result, ValidationResult::Reject);
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "499,999 AXC below genesis tier 500,000 threshold");
-        }
+    #[test]
+    fn a_self_audit_verifies_under_core_and_carries_real_content() {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x71u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let entries = axiom_core_logic::pulse::PULSE_CANDIDACY_MIN_ENTRIES as u32;
+        let tick = 1_000_000u64;
+        let p = self_audit_pulse(&pk, tick, entries);
+        assert_eq!(p.entry_count, entries);
+        assert_eq!(p.epoch, axiom_core_logic::pulse::pulse_epoch_of_tick(tick));
+        assert!(p.sample_size >= 1 && p.audit_hash != [0u8; 32] && p.argon2id_per_sec > 0);
+        // Part iii: the issuer's native replay reproduces the sample from
+        // (pk, tick) — and fails for another tick, another key, a tampered hash.
+        assert_eq!(verify_self_audit_sample(&pk, tick, p.entry_count, p.sample_size, &p.full_accumulator, &p.audit_hash), Ok(()));
+        assert!(verify_self_audit_sample(&pk, tick + 1, p.entry_count, p.sample_size, &p.full_accumulator, &p.audit_hash).is_err(), "another tick is another chain");
+        assert!(verify_self_audit_sample(&[0x72u8; 32], tick, p.entry_count, p.sample_size, &p.full_accumulator, &p.audit_hash).is_err(), "another key is another chain");
+        let mut bad = p.audit_hash; bad[0] ^= 1;
+        assert!(verify_self_audit_sample(&pk, tick, p.entry_count, p.sample_size, &p.full_accumulator, &bad).is_err(), "a forged hash does not reproduce");
+        let payload = axiom_core_logic::pulse::pulse_proof_sign_payload(&pk, p.epoch, &p.full_accumulator, &p.audit_hash, Some(tick));
+        let proof = axiom_core_logic::wire_client::PulseProofRequest {
+            validator_pk: pk, epoch: p.epoch, full_accumulator: p.full_accumulator, entry_count: p.entry_count,
+            sample_size: p.sample_size, audit_hash: p.audit_hash, argon2id_per_sec: p.argon2id_per_sec,
+            signature: sk.sign(&payload).to_bytes().to_vec(),
+            attested_tick: Some(tick),
+        };
+        // A provisional bundle naming this key as its Ed25519 subject accepts the proof.
+        let mut target = axiom_core_logic::types::VBC {
+            genesis_lineage: [0u8; 32], network_size_baseline: 9, baseline_tick: tick, version: 0x09,
+            validator_id: [1u8; 32], subject_pubkey_sphincs: vec![2u8; 32], subject_pubkey_dilithium: vec![0u8; 1952],
+            subject_pubkey_ed25519: pk.to_vec(), pgp_fingerprint: Vec::new(), node_name: String::new(),
+            proof_cap: String::new(), issued_at: tick, expires_at: tick + 3600, chain_depth: 1,
+            issuer_set: vec![vec![3u8; 32], vec![4u8; 32], vec![5u8; 32]], signatures: Vec::new(),
+            max_tx: 0, founding_vbc_hash: [0u8; 32], nabla_registration: None,
+        };
+        let _ = &mut target;
+        let bundle = axiom_core_logic::types::VBCProofBundle { target_vbc: target, supporting_vbcs: Vec::new(), candidacy_pulse: Some(proof), renewal_work_receipt: None };
+        assert_eq!(axiom_core_logic::pulse::verify_candidacy_pulse(&bundle, tick, tick), Ok(()));
+    }
+}
 
-        #[test]
-        fn test_cl8_native_genesis_rejects_zero() {
-            // Genesis validator rejects zero-balance candidate
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 0);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_eq!(result.result, ValidationResult::Reject);
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake));
-        }
-
-        #[test]
-        fn test_cl8_native_nongenesis_approves_tier3() {
-            // Non-genesis validator approves candidate with 500 AXC (Tier 3)
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let non_genesis_id = [0xAA; 32]; // not in GENESIS_VALIDATORS
-            let inputs = make_cl8_inputs(non_genesis_id, 500);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_ne!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "500 AXC should pass non-genesis tier check");
-        }
-
-        #[test]
-        fn test_cl8_native_nongenesis_rejects_below_tier3() {
-            // Non-genesis validator rejects candidate with 499 AXC
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let non_genesis_id = [0xAA; 32];
-            let inputs = make_cl8_inputs(non_genesis_id, 499);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_eq!(result.result, ValidationResult::Reject);
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "499 AXC below non-genesis tier 500 threshold");
-        }
-
-        #[test]
-        fn test_cl8_native_nongenesis_rejects_zero() {
-            // Non-genesis validator rejects zero-balance candidate
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let non_genesis_id = [0xBB; 32];
-            let inputs = make_cl8_inputs(non_genesis_id, 0);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_eq!(result.result, ValidationResult::Reject);
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake));
-        }
-
-        #[test]
-        fn test_cl8_native_no_balance_no_proof_is_nbc() {
-            // candidate_balance = None + nabla_stake_proof = None → NBC signing path
-            // No stake check (NBC doesn't require stake, only identity binding)
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let non_genesis_id = [0xCC; 32];
-            let mut inputs = make_cl8_inputs(non_genesis_id, 0);
-            inputs.candidate_balance = None;
-            inputs.nabla_stake_proof = None;
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_ne!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "No balance + no proof = NBC path, stake check skipped");
-        }
-
-        #[test]
-        fn test_cl8_native_exact_thresholds() {
-            // Exact threshold values — both should pass stake check
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-
-            // Genesis at exactly 500,000
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 500_000);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_ne!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "Exact genesis threshold (500,000) should pass");
-
-            // Non-genesis at exactly 500
-            let non_genesis_id = [0xDD; 32];
-            let inputs2 = make_cl8_inputs(non_genesis_id, 500);
-            let result2 = avm.execute(inputs2).expect("CL8 execute failed");
-            assert_ne!(result2.rejection_reason, Some(ValidationError::InsufficientStake),
-                "Exact non-genesis threshold (500) should pass");
-        }
-
-        #[test]
-        fn test_cl8_native_nongenesis_high_balance() {
-            // Non-genesis with Tier 2 level balance (500,000) — should pass (500,000 >= 500)
-            let avm = AvmInterpreter::new(vec![0x00], [0u8; 32]);
-            let non_genesis_id = [0xEE; 32];
-            let inputs = make_cl8_inputs(non_genesis_id, 500_000);
-            let result = avm.execute(inputs).expect("CL8 execute failed");
-            assert_ne!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                "Non-genesis with 500,000 AXC should pass (well above 500 threshold)");
-        }
-
-        // ── Real ELF tests (require compiled axiom-core.elf) ──
-
-        #[test]
-        fn test_cl8_elf_genesis_rejects_low_stake() {
-            let elf = match find_elf() {
-                Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
-            };
-            let avm = AvmInterpreter::new(elf, [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 1_000);
-            let result = avm.execute(inputs).expect("CL8 ELF execute failed");
-            assert_eq!(result.result, ValidationResult::Reject,
-                "ELF: 1,000 AXC below genesis tier must be rejected");
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake));
-        }
-
-        #[test]
-        fn test_cl8_elf_genesis_approves_tier2() {
-            // Passes stake check, then hits SPHINCS+ signing with dummy keys.
-            // ELF may hit instruction limit during SPHINCS+ (expected) — that's OK.
-            // candidate_balance is gated behind debug_assertions (beta2 fix).
-            // The release ELF rejects candidate_balance — production requires NablaStakeProof.
-            // This test verifies the ELF correctly rejects the legacy path.
-            // TODO: Add a separate ELF test with real NablaStakeProof for the production path.
-            let elf = match find_elf() {
-                Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
-            };
-            let avm = AvmInterpreter::new(elf, [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 500_000);
-            match avm.execute(inputs) {
-                Ok(result) => {
-                    // Release ELF: candidate_balance rejected. This is CORRECT.
-                    // Production validators MUST use NablaStakeProof.
-                    assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                        "Release ELF correctly rejects candidate_balance (use NablaStakeProof)");
-                }
-                Err(AvmError::ExecutionError(msg)) if msg.contains("instruction limit") => {
-                    eprintln!("ELF hit instruction limit — OK");
-                }
-                Err(e) => panic!("Unexpected error: {:?}", e),
-            }
-        }
-
-        #[test]
-        fn test_cl8_elf_genesis_rejects_zero() {
-            let elf = match find_elf() {
-                Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
-            };
-            let avm = AvmInterpreter::new(elf, [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 0);
-            let result = avm.execute(inputs).expect("CL8 ELF execute failed");
-            assert_eq!(result.result, ValidationResult::Reject,
-                "ELF: zero-balance must be rejected");
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake));
-        }
-
-        #[test]
-        fn test_cl8_elf_nongenesis_rejects_candidate_balance() {
-            // Release ELF rejects candidate_balance — production requires NablaStakeProof.
-            let elf = match find_elf() {
-                Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
-            };
-            let avm = AvmInterpreter::new(elf, [0u8; 32]);
-            let non_genesis_id = [0xAA; 32];
-            let inputs = make_cl8_inputs(non_genesis_id, 500);
-            match avm.execute(inputs) {
-                Ok(result) => {
-                    assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake),
-                        "Release ELF correctly rejects candidate_balance (use NablaStakeProof)");
-                }
-                Err(AvmError::ExecutionError(msg)) if msg.contains("instruction limit") => {
-                    eprintln!("ELF hit instruction limit — OK");
-                }
-                Err(e) => panic!("Unexpected error: {:?}", e),
-            }
-        }
-
-        #[test]
-        fn test_cl8_elf_nongenesis_rejects_below_tier3() {
-            let elf = match find_elf() {
-                Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
-            };
-            let avm = AvmInterpreter::new(elf, [0u8; 32]);
-            let non_genesis_id = [0xAA; 32];
-            let inputs = make_cl8_inputs(non_genesis_id, 499);
-            let result = avm.execute(inputs).expect("CL8 ELF execute failed");
-            assert_eq!(result.result, ValidationResult::Reject,
-                "ELF: 499 AXC below non-genesis tier must be rejected");
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake));
-        }
-
-        #[test]
-        fn test_cl8_elf_boundary_genesis_499999() {
-            // Boundary: genesis with 499,999 — one below threshold
-            let elf = match find_elf() {
-                Some(e) => e,
-                None => { eprintln!("SKIP: ELF not found"); return; }
-            };
-            let avm = AvmInterpreter::new(elf, [0u8; 32]);
-            let genesis_id = axiom_core_logic::genesis::GENESIS_VALIDATORS[0];
-            let inputs = make_cl8_inputs(genesis_id, 499_999);
-            let result = avm.execute(inputs).expect("CL8 ELF execute failed");
-            assert_eq!(result.result, ValidationResult::Reject,
-                "ELF: 499,999 AXC must be rejected by genesis");
-            assert_eq!(result.rejection_reason, Some(ValidationError::InsufficientStake));
-        }
+#[cfg(test)]
+mod ban_wording_tests {
+    #[test]
+    fn duration_text_states_the_window_in_its_natural_unit() {
+        assert_eq!(super::duration_text(3_600), "1 h");
+        assert_eq!(super::duration_text(86_400), "24 h");
+        assert_eq!(super::duration_text(5_400), "90 min");
+        assert_eq!(super::duration_text(45), "45 s");
     }
 }

@@ -1,0 +1,25 @@
+# Genesis re-domaining map — the 10 genesis validators' real emails.
+# See AXIOM_OPS_GenesisReDomaining.md.
+# col 1 = the OLD @axiom stake local part (validator_<name>, historical reference);
+# col 2 = the NEW real email each validator uses. Stake AND operational share the
+#         email, differing only by pk_bind hex.
+# @trustmesh.org is the published seed domain each node already receives at, and is
+# REAL-class (passes the dev/real isolation gate). The old "validator_" prefix is
+# dropped (it was never the validator naming).
+#
+# ⚠ APPROACH A (the owner 2026-09-20): the real run is a FRESH GENESIS with FRESH keys —
+# NOTHING carries over from @axiom. New keys, new pk_bind, re-issued VBCs, a fresh
+# 1,000,000 AXC opening by derivation. This file maps the EMAILS only; the full
+# wallet_id <name>@trustmesh.org/<pk_bind> gets its hex when the operator creates
+# each fresh stake wallet, and goes into genesis-ceremony.toml's wallet_id field.
+# (The earlier "same key, same bond" narrow plan is superseded — §6 of the ops doc.)
+validator_alpha     alpha@trustmesh.org
+validator_beta      beta@trustmesh.org
+validator_gamma     gamma@trustmesh.org
+validator_delta     delta@trustmesh.org
+validator_epsilon   epsilon@trustmesh.org
+validator_zeta      zeta@trustmesh.org
+validator_eta       eta@trustmesh.org
+validator_theta     theta@trustmesh.org
+validator_iota      iota@trustmesh.org
+validator_kappa     kappa@trustmesh.org

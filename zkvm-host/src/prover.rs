@@ -87,60 +87,27 @@ impl ZkvmProver {
         })
     }
 
-    /// Execute core-logic (via AVM) inside zkVM and generate STARK proof.
-    #[cfg(feature = "prove")]
-    pub fn prove(&mut self, inputs: PublicInputs) -> Result<(PublicOutputs, ZkvmReceipt), ZkvmError> {
-        // Load ELF from config
-        let elf = self.config.load_elf()?;
-
-        // CBOR-frame both inputs the guest reads (PublicInputs, then an
-        // Option<FactCargo> — main.rs reads two frames). The basic prove path
-        // carries no cargo, so the second frame is `None`. Each frame is a
-        // `Vec<u8>` carried over risc0's stable word-serde; the guest decodes
-        // the inner CBOR (see to_cbor_frame).
-        let inputs_frame = to_cbor_frame(&inputs)?;
-        let cargo_frame = to_cbor_frame(&None::<FactCargo>)?;
-
-        // Build the executor environment with the CBOR frames
-        let env = ExecutorEnv::builder()
-            .write(&inputs_frame)
-            .map_err(|e| ZkvmError::ProofGenerationFailed(format!("Failed to write inputs frame: {}", e)))?
-            .write(&cargo_frame)
-            .map_err(|e| ZkvmError::ProofGenerationFailed(format!("Failed to write cargo frame: {}", e)))?
-            .build()
-            .map_err(|e| ZkvmError::ProofGenerationFailed(format!("Failed to build env: {}", e)))?;
-
-        // Get the default prover
-        let prover = default_prover();
-
-        // Prove the execution
-        let prove_info = prover.prove(env, elf)
-            .map_err(|e| ZkvmError::ProofGenerationFailed(format!("Proving failed: {}", e)))?;
-
-        let receipt = prove_info.receipt;
-
-        // Decode the outputs from the journal
-        let outputs: PublicOutputs = receipt.journal.decode()
-            .map_err(|e| ZkvmError::ProofGenerationFailed(format!("Failed to decode outputs: {}", e)))?;
-
-        // Convert to our receipt format
-        let journal = receipt.journal.bytes.clone();
-        let seal = bincode::serialize(&receipt)
-            .map_err(|e| ZkvmError::ProofGenerationFailed(format!("Failed to serialize seal: {}", e)))?;
-
-        let zkvm_receipt = ZkvmReceipt::new(journal, seal, self.program_digest);
-
-        Ok((outputs, zkvm_receipt))
-    }
-
-    /// Proving requires the `prove` feature.
-    #[cfg(not(feature = "prove"))]
-    pub fn prove(&mut self, _inputs: PublicInputs) -> Result<(PublicOutputs, ZkvmReceipt), ZkvmError> {
-        Err(ZkvmError::ProofGenerationFailed(
-            "Real proving requires the 'prove' feature. \
-             Compile with --features prove".to_string()
-        ))
-    }
+    // DELETED 2026-09-02: `ZkvmProver::prove()` (both the `prove`-gated body
+    // and its non-feature stub).
+    //
+    // It was the ORIGINAL zkVM design: run all of Core inside the guest and
+    // return a fully STARK-proved `PublicOutputs` — Dilithium FACT signing,
+    // FACT-chain verification and witness validation all inside the ZK
+    // boundary. That design was abandoned for cost: the guest
+    // (core/zkvm-guest/guest/src/main.rs:149) commits a `ZkpCheckpointOutputs`
+    // and nothing else, so `prove()` decoded the journal as a type no guest
+    // produces and always died with "expected variant index 0 <= i < 3".
+    //
+    // It was not repairable in place. A `PublicOutputs` journal needs a
+    // full-Core guest, which is the thing the checkpoint design deliberately
+    // walked away from — and it would also break the two-VM invariant, which
+    // holds over the checkpoint SUBSET (`result`, `produced_state_id`,
+    // `new_balance`, `new_wallet_seq`, `rejection_reason`), never over
+    // `PublicOutputs`.
+    //
+    // `prove_checkpoint()` below is the live path and always was in practice:
+    // prover-worker and Lambda call it. Do not reintroduce a full-outputs
+    // prove without first changing what the guest commits.
 
     /// Prove with minimal ZK boundary (checkpoint mode).
     ///
@@ -167,6 +134,18 @@ impl ZkvmProver {
         guest_inputs.my_dilithium_sk = None;
         guest_inputs.my_dilithium_pk = None;
         guest_inputs.issuer_sphincs_sk = None;
+        // KI#155 (2026-09-13): the guest deserialises this whole frame IN-CIRCUIT
+        // and `execute_cl3_zkp_checkpoint` reads none of the fields below. The
+        // KI#145 certificate set alone is ~165 KB of SPHINCS+ bundles on a FACT
+        // send — MEASURED 58 segments / 60.8 M cycles vs 1 segment for a plain
+        // vector, ~95 % of it decoding data the proof ignores. Same strips as
+        // Lambda's ZKP path (`core_client.rs`), plus the certificates both
+        // predated. The journal binds transaction fields + state, never this
+        // frame, so the proof's meaning is unchanged — only its cost.
+        guest_inputs.fact_certificates = Vec::new();
+        guest_inputs.vbc_bundle = None;
+        guest_inputs.fact_witness_sigs = Vec::new();
+        guest_inputs.cl1_execution_proof = None;
 
         // Convert PublicOutputs → lightweight FactCargo (only txid, saves ~1M RISC-V cycles)
         // fact_signature (3,309 bytes) stays on host — attached to output post-proving.

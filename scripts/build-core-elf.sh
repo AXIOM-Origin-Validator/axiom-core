@@ -53,17 +53,34 @@ if ! rustup target list --installed | grep -q "$TARGET"; then
     exit 1
 fi
 
-# Detect dev/testnet WALLET_IDENTITY_KEY (0xb0, 0xf7 prefix). Release builds
-# of axiom-core-logic fail-compile while the dev key is in place; the
-# `dev-mode` feature disables that compile guard. Auto-pass it for dev builds
-# so the script DTRT on testnet without requiring a manual flag, and skip it
-# on a post-ceremony tree so mainnet builds stay strict.
-WALLET_KEY_FILE="$SRC_DIR/core/logic/src/wallet_id.rs"
-EXTRA_FEATURES=""
-BUILD_MODE="mainnet"
-if grep -qE '^\s*0xb0,\s*0xf7,' "$WALLET_KEY_FILE"; then
-    EXTRA_FEATURES="--features axiom-core-logic/dev-mode"
-    BUILD_MODE="dev (WALLET_IDENTITY_KEY still 0xb0,0xf7 — pre-ceremony)"
+# Dev or real? NOT decided here (KI#240). scripts/build_profile.py owns the ONE
+# rule — the WALLET_IDENTITY_KEY dev-prefix test (0xb0, 0xf7) this script used
+# to inline — and every native/SDK build asks the SAME rule, so the ELF and the
+# natives can no longer be built from two different answers (trustmesh
+# 2026-10-01: ELF real, natives dev -> E_STAKE_LOCK_TIME_DISAGREEMENT).
+# Fail closed: an undecidable tree aborts the build (set -e on the assignment).
+PROFILE="$(python3 "$SCRIPT_DIR/build_profile.py")"
+EXTRA_FEATURES="$(python3 "$SCRIPT_DIR/build_profile.py" --features axiom-avm-guest)"
+if [ "$PROFILE" = "dev" ]; then
+    BUILD_MODE="dev (WALLET_IDENTITY_KEY still 0xb0,0xf7 — pre-ceremony; dev register twins)"
+else
+    BUILD_MODE="real (ceremony-keyed tree; real register twins)"
+fi
+# ╔═ BOOTSTRAP SUBSIDY — REMOVE WHEN POOLS DRAIN ═══════════════╗
+# Extra core features for the guest, e.g. AXIOM_EXTRA_CORE_FEATURES=bootstrap-subsidy
+# (AXIOM_DESIGN_ValidatorJoin.md §5.2.5). MUST match what the NATIVE builds
+# enable (scripts/axiom-env.py) — the guest and native are two compilations of
+# core/logic, and a feature on one but not the other is a consensus split, not
+# a config difference.
+# ╚═════════════════════════════════════════════════════════════╝
+if [ -n "${AXIOM_EXTRA_CORE_FEATURES:-}" ]; then
+    # KI#240: the tuning profile is the rule's alone — an extra `dev-mode` here
+    # would build a DEV ELF on a ceremony-keyed tree beside REAL natives.
+    case " ${AXIOM_EXTRA_CORE_FEATURES} " in
+        *" dev-mode "*) echo "ERROR: AXIOM_EXTRA_CORE_FEATURES must not name dev-mode — the profile is decided by scripts/build_profile.py" >&2; exit 1 ;;
+    esac
+    EXTRA_FEATURES="$EXTRA_FEATURES --features axiom-core-logic/${AXIOM_EXTRA_CORE_FEATURES}"
+    echo "  Extra core features: ${AXIOM_EXTRA_CORE_FEATURES}"
 fi
 
 echo "Building axiom-core.elf..."
@@ -169,6 +186,22 @@ echo "Published runtime: $RUNTIME_ELF"
 # Write CORE_ID.txt (no trailing whitespace).
 printf '%s\n' "$CORE_ID" > "$OUTPUT_DIR/CORE_ID.txt"
 echo "Written: $OUTPUT_DIR/CORE_ID.txt"
+
+# ╔═ GUEST/NATIVE FEATURE PARITY — RECORD WHAT THIS ELF WAS BUILT WITH ═╗
+# The guest and the natives are TWO COMPILATIONS OF core/logic. A feature on
+# one but not the other is a CONSENSUS SPLIT, not a config difference — and it
+# is LATENT: smoke passes, because only the feature-gated path diverges.
+#
+# That happened on 2026-09-03: the ELF was built without `bootstrap-subsidy`
+# while axiom-env.py hardcodes it for lambda/antie/nabla, and the whole fleet
+# (including a remote node) ran the split for a full rotation. Nothing caught
+# it; it surfaced only when a subsidy claim was attempted.
+#
+# So the feature set is now RECORDED beside the CoreID, and axiom-env.py
+# compares its native feature list against this file and FAILS on a mismatch.
+# ╚════════════════════════════════════════════════════════════════════╝
+printf '%s\n' "${AXIOM_EXTRA_CORE_FEATURES:-}" > "$OUTPUT_DIR/CORE_FEATURES.txt"
+echo "Written: $OUTPUT_DIR/CORE_FEATURES.txt (extra core features: '${AXIOM_EXTRA_CORE_FEATURES:-<none>}')"
 
 echo ""
 echo "To set as canonical for release builds:"

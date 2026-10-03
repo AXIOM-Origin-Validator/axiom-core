@@ -57,15 +57,22 @@ pub fn compute_console_chain_hash(cert: &ConsoleCertificate) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Compute the pick commitment for a selector's picks.
+/// The payload a selector signs over its picks (YPX-013; YP Appendix domain-tag
+/// table, `AXIOM_CONSOLE_PICK`):
 ///
 /// ```text
-/// BLAKE3("AXIOM_CONSOLE_PICK" || selector_id || picks[0..4] || generation)
+/// BLAKE3("AXIOM_CONSOLE_PICK" || selector_id || picks[0..4] || election_tick_le_u64)
 /// ```
-pub fn compute_pick_commitment(
+///
+/// THE one builder (Pattern 1) — `resolve_election` verifies every
+/// `SelectorPick.signature` over exactly this. KI#245 (2026-10-02): a second,
+/// dead builder `compute_pick_commitment` bound `generation: u32` instead of
+/// the election tick under the SAME tag (two byte layouts, one tag; zero
+/// callers) — it was DELETED, and the verifier's inline preimage moved here.
+pub fn compute_pick_signing_payload(
     selector_id: &[u8; 32],
     picks: &[[u8; 32]],
-    generation: u32,
+    election_tick: u64,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(DOMAIN_CONSOLE_PICK);
@@ -73,7 +80,7 @@ pub fn compute_pick_commitment(
     for pick in picks {
         h.update(pick);
     }
-    h.update(&generation.to_le_bytes());
+    h.update(&election_tick.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -211,30 +218,27 @@ pub fn resolve_election(
 
         // AUDIT-FIX v2.11.14 (Phase 7, Finding 2): Verify SelectorPick signature.
         // Uses selector_ed25519_pk (from VBC), NOT selector_id (= BLAKE3(sphincs_pk)).
-        // Signature covers: BLAKE3("AXIOM_CONSOLE_PICK" || selector_id || picks || tick)
-        if !pick.signature.is_empty() {
-            // Verify the Ed25519 PK is non-zero (caller must provide it)
-            if pick.selector_ed25519_pk == [0u8; 32] {
-                return Err(ValidationError::ConsoleInvalidPick);
-            }
-            let mut msg = Vec::new();
-            msg.extend_from_slice(b"AXIOM_CONSOLE_PICK");
-            msg.extend_from_slice(&pick.selector_id);
-            for p in &pick.picks {
-                msg.extend_from_slice(p);
-            }
-            msg.extend_from_slice(&election_tick.to_le_bytes());
-            let commitment = *blake3::hash(&msg).as_bytes();
-            if crate::crypto::verify_ed25519(
-                &pick.selector_ed25519_pk,
-                &commitment,
-                &pick.signature,
-            ).is_err() {
-                return Err(ValidationError::ConsoleInvalidPick);
-            }
-        } else {
-            // Empty signature = unsigned pick. Reject unless in bootstrap/test mode.
-            #[cfg(not(debug_assertions))]
+        // Signature covers `compute_pick_signing_payload` (the one builder).
+        //
+        // An EMPTY signature is refused in EVERY build. Until 2026-10-02 the
+        // refusal was `#[cfg(not(debug_assertions))]`, so a DEBUG-built Core
+        // ACCEPTED unsigned picks that the release ELF refuses — one source, two
+        // consensus rules, chosen by the compiler profile — and four
+        // `console::tests` passed in debug only because they never signed (they
+        // failed under `cargo test --release`). Debug is not a bootstrap mode.
+        if pick.signature.is_empty() {
+            return Err(ValidationError::ConsoleInvalidPick);
+        }
+        // Verify the Ed25519 PK is non-zero (caller must provide it)
+        if pick.selector_ed25519_pk == [0u8; 32] {
+            return Err(ValidationError::ConsoleInvalidPick);
+        }
+        let commitment = compute_pick_signing_payload(&pick.selector_id, &pick.picks, election_tick);
+        if crate::crypto::verify_ed25519(
+            &pick.selector_ed25519_pk,
+            &commitment,
+            &pick.signature,
+        ).is_err() {
             return Err(ValidationError::ConsoleInvalidPick);
         }
     }
@@ -305,6 +309,29 @@ mod tests {
     use crate::types::{
         ConsoleCertificate, CONSOLE_MAX_ELECTION_ATTEMPTS, CONSOLE_CHAIN_DEPTH,
     };
+
+    /// A pick SIGNED as Core verifies it (`compute_pick_signing_payload`), for
+    /// election tick `CONSOLE_TICKS_PER_YEAR` — the tick every test below uses.
+    /// The selector's Ed25519 key is derived from its id (test-only).
+    fn sp(selector_id: [u8; 32], picks: Vec<[u8; 32]>) -> SelectorPick {
+        sp_at(selector_id, picks, CONSOLE_TICKS_PER_YEAR)
+    }
+
+    fn sp_at(selector_id: [u8; 32], picks: Vec<[u8; 32]>, tick: u64) -> SelectorPick {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&selector_id);
+        let payload = compute_pick_signing_payload(&selector_id, &picks, tick);
+        SelectorPick {
+            selector_id,
+            selector_ed25519_pk: sk.verifying_key().to_bytes(),
+            signature: sk.sign(&payload).to_bytes().to_vec(),
+            picks,
+        }
+    }
+
+    fn noms(n: u8) -> Vec<[u8; 32]> {
+        (0..n).map(|i| { let mut id = [0u8; 32]; id[0] = 100 + i; id }).collect()
+    }
 
     fn make_genesis_cert() -> ConsoleCertificate {
         let seats: Vec<[u8; 32]> = (0..15).map(|i| {
@@ -489,12 +516,7 @@ mod tests {
             let picked: Vec<[u8; 32]> = (0..5).map(|p| {
                 nominations[(s * 5 + p) as usize]
             }).collect();
-            SelectorPick {
-                selector_id,
-                picks: picked,
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            }
+            sp(selector_id, picked)
         }).collect();
 
         let result = resolve_election(
@@ -525,24 +547,9 @@ mod tests {
 
         // 3 selectors pick with heavy overlap (only 8 unique across all picks)
         let picks = vec![
-            SelectorPick {
-                selector_id: current.seats[0],
-                picks: nominations[0..5].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[1],
-                picks: nominations[3..8].to_vec(), // overlaps with first
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[2],
-                picks: nominations[5..10].to_vec(), // overlaps with second
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
+            sp(current.seats[0], nominations[0..5].to_vec()),
+            sp(current.seats[1], nominations[3..8].to_vec()),
+            sp(current.seats[2], nominations[5..10].to_vec()),
         ];
 
         let result = resolve_election(
@@ -574,24 +581,9 @@ mod tests {
         fake_selector[0] = 0xFF; // not in current Console
 
         let picks = vec![
-            SelectorPick {
-                selector_id: fake_selector, // INVALID
-                picks: nominations[0..5].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[1],
-                picks: nominations[5..10].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[2],
-                picks: nominations[10..15].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
+            sp(fake_selector, nominations[0..5].to_vec()), // INVALID selector
+            sp(current.seats[1], nominations[5..10].to_vec()),
+            sp(current.seats[2], nominations[10..15].to_vec()),
         ];
 
         let result = resolve_election(
@@ -620,24 +612,9 @@ mod tests {
         bad_picks[4] = rogue; // slip in a non-nominee
 
         let picks = vec![
-            SelectorPick {
-                selector_id: current.seats[0],
-                picks: bad_picks,
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[1],
-                picks: nominations[5..10].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[2],
-                picks: nominations[10..15].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
+            sp(current.seats[0], bad_picks),
+            sp(current.seats[1], nominations[5..10].to_vec()),
+            sp(current.seats[2], nominations[10..15].to_vec()),
         ];
 
         let result = resolve_election(
@@ -661,18 +638,8 @@ mod tests {
 
         // Only 2 selectors instead of 3
         let picks = vec![
-            SelectorPick {
-                selector_id: current.seats[0],
-                picks: nominations[0..5].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
-            SelectorPick {
-                selector_id: current.seats[1],
-                picks: nominations[5..10].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
+            sp(current.seats[0], nominations[0..5].to_vec()),
+            sp(current.seats[1], nominations[5..10].to_vec()),
         ];
 
         let result = resolve_election(
@@ -685,22 +652,50 @@ mod tests {
         assert_eq!(result, Err(ValidationError::ConsoleIncompleteSelection));
     }
 
+    /// KAT computed in Python from the YP layout (NOT from this code):
+    /// selector `C0×32`, picks `D0×32..D4×32`, election_tick 1000.
     #[test]
-    fn test_pick_commitment_deterministic() {
-        let selector = [0x01; 32];
-        let picks: Vec<[u8; 32]> = (0..5).map(|i| [i + 10; 32]).collect();
-        let c1 = compute_pick_commitment(&selector, &picks, 1);
-        let c2 = compute_pick_commitment(&selector, &picks, 1);
-        assert_eq!(c1, c2);
+    fn pick_signing_payload_kat() {
+        let picks: Vec<[u8; 32]> = (0..5u8).map(|i| [0xD0 + i; 32]).collect();
+        assert_eq!(
+            hex::encode(compute_pick_signing_payload(&[0xC0; 32], &picks, 1000)),
+            "4e93c1630d46d0878f77ad89e1b96f82730f8731df521908091ff7e5dd284a9a",
+        );
     }
 
+    /// An unsigned pick is refused in EVERY build profile (was release-only).
     #[test]
-    fn test_pick_commitment_varies_by_generation() {
-        let selector = [0x01; 32];
-        let picks: Vec<[u8; 32]> = (0..5).map(|i| [i + 10; 32]).collect();
-        let c1 = compute_pick_commitment(&selector, &picks, 1);
-        let c2 = compute_pick_commitment(&selector, &picks, 2);
-        assert_ne!(c1, c2);
+    fn unsigned_pick_is_refused_in_every_build() {
+        let current = make_genesis_cert();
+        let nominations = noms(15);
+        let mut picks: Vec<SelectorPick> = (0..3usize)
+            .map(|s| sp(current.seats[s], nominations[s * 5..s * 5 + 5].to_vec()))
+            .collect();
+        picks[1].signature = Vec::new();
+        assert_eq!(
+            resolve_election(&picks, &current.seats, &nominations, CONSOLE_TICKS_PER_YEAR,
+                &compute_console_chain_hash(&current)),
+            Err(ValidationError::ConsoleInvalidPick),
+        );
+    }
+
+    /// A pick signed for another election tick does not verify (the tick is bound).
+    #[test]
+    fn pick_signed_for_another_tick_is_refused() {
+        let current = make_genesis_cert();
+        let nominations = noms(15);
+        let mut picks: Vec<SelectorPick> = (0..3usize)
+            .map(|s| sp(current.seats[s], nominations[s * 5..s * 5 + 5].to_vec()))
+            .collect();
+        let tick = CONSOLE_TICKS_PER_YEAR;
+        assert!(resolve_election(&picks, &current.seats, &nominations, tick,
+            &compute_console_chain_hash(&current)).is_ok(), "control: correctly signed picks resolve");
+        picks[0] = sp_at(current.seats[0], nominations[0..5].to_vec(), tick + 1);
+        assert_eq!(
+            resolve_election(&picks, &current.seats, &nominations, tick,
+                &compute_console_chain_hash(&current)),
+            Err(ValidationError::ConsoleInvalidPick),
+        );
     }
 
     #[test]
@@ -800,12 +795,7 @@ mod tests {
             let picked: Vec<[u8; 32]> = (0..5).map(|p| {
                 nominations[(s * 5 + p) as usize]
             }).collect();
-            SelectorPick {
-                selector_id,
-                picks: picked,
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            }
+            sp(selector_id, picked)
         }).collect();
 
         let chain_hash = compute_console_chain_hash(&current);
@@ -989,12 +979,7 @@ mod tests {
         }).collect();
 
         let make_pick = |selector_idx: usize, nom_start: usize| -> SelectorPick {
-            SelectorPick {
-                selector_id: current.seats[selector_idx],
-                picks: nominations[nom_start..nom_start + 5].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            }
+            sp(current.seats[selector_idx], nominations[nom_start..nom_start + 5].to_vec())
         };
 
         // Attack 1: Only 1 selector submits (minority of 1/3)
@@ -1019,12 +1004,7 @@ mod tests {
         let rogue_picks = vec![
             make_pick(0, 0),
             make_pick(1, 5),
-            SelectorPick {
-                selector_id: outsider_id,
-                picks: nominations[10..15].to_vec(),
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
+            sp(outsider_id, nominations[10..15].to_vec()),
         ];
         assert_eq!(
             resolve_election(&rogue_picks, &current.seats, &nominations, tick, &chain_hash),
@@ -1040,12 +1020,7 @@ mod tests {
         let smuggle_picks = vec![
             make_pick(0, 0),
             make_pick(1, 5),
-            SelectorPick {
-                selector_id: current.seats[2],
-                picks: bad_noms,
-                signature: Vec::new(),
-                selector_ed25519_pk: [0u8; 32],
-            },
+            sp(current.seats[2], bad_noms),
         ];
         assert_eq!(
             resolve_election(&smuggle_picks, &current.seats, &nominations, tick, &chain_hash),

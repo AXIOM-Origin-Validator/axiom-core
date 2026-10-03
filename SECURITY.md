@@ -143,16 +143,24 @@ vectors and a reproducible Core identity:
 cargo run -p axiom-core-logic --example generate_vectors > tests/consensus_vectors.json
 
 # Run the conformance suite against a compiled Core:
-python3 tests/run_conformance.py --core-bin ./core.bin
+cargo build --release -p axiom-core-bin --features axiom-core-logic/dev-mode
+python3 tests/run_conformance.py --core-bin ./target/release/core-bin
 
 # Check the consensus boundary before any change to Core:
 bash scripts/check_consensus_boundary.sh
 ```
 
 Every Core execution is bound to a `CoreID` (a BLAKE3 hash of the canonical
-ELF). All honest participants run the *same* ELF; a divergent Core is rejected
-by the DMAP/zkVM gate. Reproducing the `CoreID` and passing the conformance
-vectors is sufficient to verify that an implementation matches consensus.
+ELF — `core/artifacts/axiom-core.elf`, the riscv32im guest the DMAP-VM
+interprets). All honest participants run the *same* ELF; a divergent Core is
+rejected by the DMAP gate.
+
+**What these two checks are worth.** Reproducing the `CoreID` is the strong
+result: it establishes that the artifact you audited is the artifact the network
+executes. The conformance runner is deliberately narrower — it compares the
+`result` field (accept vs reject) and nothing else, so passing it is a necessary
+condition for an independent implementation, not a proof of output equivalence.
+Do not read a green conformance run as a certificate that consensus rules match.
 
 ## Acknowledgements
 

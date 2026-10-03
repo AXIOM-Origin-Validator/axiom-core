@@ -38,7 +38,7 @@ pub mod syscall {
 /// AUDIT-FIX v2.11.13: Increased from 500M — CL5 k=3 was hitting limit.
 /// AUDIT-FIX v2.11.16: Increased from 1B — CL5 k=5 with deep FACT chains
 /// exceeded 1B (wallets 042/062 in 72h soak). 4B provides headroom.
-pub const MAX_INSTRUCTIONS: u64 = 4_000_000_000; // 4B
+pub const MAX_INSTRUCTIONS: u64 = 64_000_000_000; // 64B — CL8 NBC-issuance SPHINCS+ sign needs > 4B (host-side AVM ceiling; JIT keeps wall-time low)
 
 /// CPU state
 pub struct Cpu {
@@ -640,7 +640,7 @@ mod tests {
     }
 
     fn make_cpu() -> Cpu {
-        let host = HostFunctions::new(0, [0u8; 32]);
+        let host = HostFunctions::new();
         Cpu::new(host, Vec::new())
     }
 

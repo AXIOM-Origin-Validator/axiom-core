@@ -13,8 +13,9 @@ third-party audit** — read every entry in that light.
 > authoritative engineering register — per-issue blast radius, fix sketches,
 > commit anchors, the numbered `KI#…` items, and the mainnet-blocking items from
 > the 2026-06-12 trust-boundary security review (KI#30 soft supply cap, KI#31
-> Silicon Pulse) — lives at
-> [`docs/AXIOM_REPORT_KnownIssues.md`](docs/AXIOM_REPORT_KnownIssues.md). Where
+> Silicon Pulse) — lives in the
+> project's private working tree as `AXIOM_REPORT_KnownIssues.md` (not in this
+> public snapshot; entries graduate here as they are verified). Where
 > the two differ on detail or severity, the engineering register is canonical;
 > this file links to it rather than duplicating severities.
 
@@ -64,8 +65,19 @@ every colluder "refills" the same lie, the cross-validator state hashes agree an
 an honest non-overlapped validator signs in good faith. The result is fabricated
 supply (inflation), not merely a local double-spend.
 
-This is the deepest structural tension in the protocol and it is currently
-**unmitigated**. It only fires when the honest-quorum assumption fails for the
+This is the deepest structural tension in the protocol, and at the **Core
+layer it is unmitigated — Core accepts the round**. It is not, however, clean
+spendable money at that point: against an honest Nabla mesh the fabricated send
+is refused registration (state-chain continuity), the honest receiver's redeem
+stalls on the sender-state quorum check, and any value forced through carries
+Core-enforced transitive scars from its unresolvable fabricated origin — marked
+and unlaunderable, a contained state divergence rather than circulating supply
+(Yellow Paper §17.10.9.1 records the full containment chain). Clean inflation
+additionally requires capturing the Nabla nodes on the sender's registration
+path and a quorum of the receiver's chosen consultation nodes — the same
+(1−h)-class residual as the double-spend case. Note the containment stack sits
+in the mesh and receiver tooling, not in Core: that is why this stays
+High–Critical. It only fires when the honest-quorum assumption fails for the
 *overlapped* set specifically. The leading planned mitigation is a per-wallet
 history commitment that Core verifies, so a fabricated prior balance would
 require forging committed history rather than colluding on a single round. See
@@ -112,6 +124,16 @@ re-verifies overlapping witnesses through a separate gate, so reachability of an
 actual exploit is being confirmed before the optimization is removed or
 re-scoped.
 
+**Amendment 2026-09-11 (found by un-rotting the non-dev test build):** the
+FACT provenance chain's per-witness "genesis anchor" is a list of public
+keys checked only for ending in a root authority public key; the witness
+key itself is self-supplied. A sender can present a fabricated provenance
+history that the receiver's Core accepts as validly witnessed. Value is still
+gated by the receipt-level overlap check on real certificates, so this is a
+provenance/scar-accounting weakness, not a supply one. Fix (a verifiable
+per-chain certificate binding) is a wire + Core change awaiting the design
+ruling; tracked as KI#145 in the engineering ledger.
+
 ### SEC-07 — Post-compression provenance rests on fewer signatures
 **Severity: Medium · Status: Open (review)**
 
@@ -122,7 +144,7 @@ must carry the full witness quorum rather than fewer signatures, so that no
 single validator can unilaterally emit an accepted checkpoint.
 
 ### SEC-08 — Judicial-freeze propagation is not quorum-adjudicated
-**Severity: Medium · Status: Open (fix planned)**
+**Severity: Medium · Status: Open — DEFERRED past the 2026-10-01 genesis ceremony by ruling (2026-09-11): the judicial freeze is a feature, not part of the money's correctness; the k-witnessed verdict is built after G1. Until then the only freeze path is the operator-authenticated admin endpoint described below, unilateral by construction — LEFT IN PLACE at G1 by ruling. the owner, 2026-09-11: "right now, it is me who can freeze — but that is the nature of a distributed system. It has to start somewhere. Once we get to more than 50 validators, the need for the genesis role becomes really small, and the rotation of the Console will be done in a year, while the economy is still very small." Read: the founder-held freeze is the declared bootstrap state, bounded by validator count and by the Console rotation, while the value at risk is small.**
 
 The administrative freeze mechanism is enforced locally by Core, but its
 propagation across the network currently uses an unauthenticated path rather than
@@ -235,6 +257,12 @@ Low-risk items with no current exploit, tracked for cleanliness:
 ## Resolved (selected)
 
 Listed for transparency — issues found and fixed during development:
+
+- **Consume-once attestation mandatory in Core (2026-09-11, KI#144).** The
+  redeem path verified the Nabla txid attestation only when the request carried
+  one, leaving presence to the untrusted Lambda. Core now refuses any online
+  redeem without it; the k=0 offline profile is the only exception. Found by a
+  cold-read review of the docs against the code.
 
 - **Transaction-field signature binding.** All security-critical fields
   (including sender identity, amount, and protocol version) are now bound into

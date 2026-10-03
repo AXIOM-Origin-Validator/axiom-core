@@ -105,6 +105,7 @@ pub mod wallet_id;
 pub mod wallet_seq;
 pub mod validation;
 pub mod cl5_inputs;
+pub mod cheque_build;
 pub mod genesis;
 pub mod nabla_genesis;
 pub mod oods_verify;
@@ -120,8 +121,12 @@ pub mod nabla_wire;
 /// Relocated here from `axiom_nabla::wire_client` (UMP Phase 1) so the
 /// SDK can construct them directly. See `wire_client.rs` header.
 pub mod wire_client;
+/// YPX-009 Pulse proof payload (ONE builder) + the §5.2.2e candidacy rule.
+pub mod pulse;
 pub mod oracle;
+pub mod emission;
 pub mod version;
+pub mod dmap;
 pub mod audit;
 pub mod ark;
 pub mod genesis_integrity;
@@ -164,21 +169,40 @@ pub mod verify {
 pub mod compute {
     pub use crate::crypto::compute_validator_id;
     pub use crate::crypto::compute_receipt_commitment;
+    // RULE 1 consolidation (2026-08-09): the ONE shared receipt-witness verify,
+    // called by Core `validate_witnesses` (crate::crypto path) AND Nabla
+    // `verify_seq_proof` (this re-export).
+    pub use crate::crypto::{count_distinct_receipt_witness_sigs, verify_receipt_witness_quorum};
+    pub use crate::crypto::client_state_sign_payload;
+    pub use crate::crypto::smt_bucket;
+    pub use crate::crypto::{fact_tx_hash, fact_confirm_payload};
+    pub use crate::validation::{compute_commitment_hash, compute_commitment_hash_parts};
+    pub use crate::crypto::{zkp_nonce_hash, txid_attest_payload};
+    // KI#205 (YPX-022 §2.1.2a): the authenticated cheque CLAIM — the claimant's
+    // signing payload (SDK signs, Nabla + Core verify) and the Nabla proof payload
+    // that covers it (Nabla signs, Core CL5 verifies). ONE builder each.
+    pub use crate::crypto::{cheque_claim_signing_payload, redeem_claim_nabla_payload};
     pub use crate::crypto::compute_oods_attestation_payload;
+    pub use crate::crypto::{compute_zkq_challenge, compute_zkq_record_payload};
     pub use crate::crypto::compute_recall_attestation_payload;
+    pub use crate::crypto::compute_ooo_confirmation_payload;
     pub use crate::crypto::compute_earnings_attestation_payload;
     pub use crate::crypto::compute_validator_pool_link_payload;
-    pub use crate::crypto::compute_validator_claim_payload;
-    pub use crate::crypto::compute_validator_withdrawal_payload;
-    pub use crate::crypto::compute_withdrawal_mint_commitment;
-    pub use crate::crypto::check_validator_withdrawal_conflict;
+    pub use crate::crypto::compute_fob_claim_attestation_payload;
+    pub use crate::crypto::compute_emission_voucher_payload;
+    pub use crate::crypto::{compute_vbc_register_payload, compute_vbc_register_request_payload};
+    // KI#156 item 4 (DELETED 2026-09-21): compute_validator_claim_payload re-export
+    // removed with the function (RETIRED withdrawal chain, 0 callers).
     pub use crate::crypto::compute_produced_state_id;
+    // KI#55 (2026-10-02): the ONE builder each of the CL10 Fan-Out diffusion id
+    // and signing payload — Core CL10 verifies with them, Lambda signs with them.
+    pub use crate::crypto::{fanout_diffusion_id, fanout_signing_payload};
     pub use crate::crypto::compute_produced_state_from_tx;
     pub use crate::crypto::compute_state_hash;
     pub use crate::crypto::compute_cheque_commitment;
     pub use crate::crypto::compute_deed_wallet_id;
     pub use crate::crypto::format_deed_address;
-    pub use crate::crypto::compute_txid;
+    pub use crate::crypto::{compute_txid, compute_txid_parts};
     pub use crate::crypto::compute_scar_consent_voucher_payload;
     pub use crate::crypto::compute_redeem_request_commitment;
     pub use crate::crypto::compute_ack_fee_commitment;
@@ -186,17 +210,14 @@ pub mod compute {
     pub use crate::crypto::compute_vbc_signing_payload_bytes;
     pub use crate::crypto::compute_clara_message;
     pub use crate::fact::compute_fact_commitment;
+    pub use crate::fact::{burn_target_is_authorized, fact_burn_target};
     pub use crate::fact::redeem_fact_chain_ref;
     pub use crate::fact::redeem_fact_sender_anchor;
     pub use crate::fact::compute_checkpoint_commitment;
     pub use crate::fact::compute_checkpoint_root;
-    pub use crate::fact::compute_scar_heal_commitment;
     pub use crate::crypto::compute_burn_commitment;
-    pub use crate::fact::verify_scar_recovery_proof;
-    pub use crate::fact::sign_scar_heal_commitment;
     pub use crate::fact::sign_fact_commitment;
     pub use crate::fact::compress_fact_chain;
-    pub use crate::fact::verify_and_compress_fact_chain;
     pub use crate::fact::merge_checkpoint_endorsements;
     pub use crate::fact::cosign_provisional_checkpoint;
     pub use crate::fact::advance_fact_checkpoint;
@@ -212,15 +233,6 @@ pub mod compute {
     pub use crate::console::verify_console_certificate;
     pub use crate::console::select_selectors;
     pub use crate::console::resolve_election;
-}
-
-/// Client-side owner_proof API.
-/// Webclient, PMC, and CLI use these to produce valid owner_proofs.
-/// Never reimplement the derivation — always use these functions.
-pub mod owner_proof {
-    pub use crate::validation::derive_owner_keypair;
-    pub use crate::validation::derive_owner_pubkey;
-    pub use crate::validation::sign_owner_proof;
 }
 
 #[cfg(test)]

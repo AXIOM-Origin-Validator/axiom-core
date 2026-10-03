@@ -49,7 +49,17 @@ pub struct TestWallet {
 impl TestWallet {
     /// Generate a new random wallet
     pub fn generate(email: &str, initial_balance: u64) -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        Self::from_signing_key(email, SigningKey::generate(&mut OsRng), initial_balance)
+    }
+
+    /// Build a wallet around a SPECIFIC Ed25519 private key (e.g. an on-disk
+    /// genesis stake key) rather than a random one — for the genesis-stake-move
+    /// harness (`core/logic/examples/genesis_stake_move_harness.rs`).
+    pub fn from_ed25519_key(email: &str, key_bytes: [u8; 32], initial_balance: u64) -> Self {
+        Self::from_signing_key(email, SigningKey::from_bytes(&key_bytes), initial_balance)
+    }
+
+    fn from_signing_key(email: &str, signing_key: SigningKey, initial_balance: u64) -> Self {
         let verifying_key = VerifyingKey::from(&signing_key);
 
         // Compute genesis state ID (Standard tier k=3/DMAP — matches the
@@ -127,6 +137,9 @@ impl TestWallet {
             wallet_id: None,
             group_members: None,
             hibernation_until: 0,
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         }
     }
 
@@ -174,7 +187,6 @@ impl TestWallet {
             nonce,
             epoch: 1, // Fixed epoch for testing
             client_sig: vec![], // Will be filled by sign_transaction
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             recall_target_tx_id: None,

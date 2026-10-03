@@ -4,176 +4,28 @@
 //! with `getrandom = { features = ["js"] }`, `extern crate alloc`, and `wasm_bindgen`).
 //! However, ALL security-critical computations live in axiom-core-logic:
 //!
-//! - Key derivation: `derive_owner_keypair` / `derive_owner_pubkey`
-//! - Owner proof: `sign_owner_proof` + Core's verification path
 //! - Transaction signing message: `compute_signing_message_public`
 //! - Genesis state_id computation
 //!
 //! These tests verify the WASM security boundary by exercising the same code paths
 //! the webclient calls, with adversarial inputs designed to find:
-//! - Collision attacks on key derivation
 //! - Signature malleability / field-exclusion attacks on signing messages
-//! - Owner proof bypass attempts
 //! - Cross-transaction replay via field manipulation
+//!
+//! The owner-proof sections (key derivation, `sign_owner_proof`, replay,
+//! tampered/missing proof) were DELETED 2026-09-25 with `Transaction.owner_proof`
+//! (KI#108): the derived key came from the wallet private key, so every
+//! property they asserted was already asserted of `client_sig`.
 
-use axiom_core_logic::owner_proof::{derive_owner_keypair, derive_owner_pubkey, sign_owner_proof};
 use axiom_core_logic::types::{Transaction, TxKind, WalletState, AXIOM_PROTOCOL_VERSION};
 use axiom_core_logic::validation::compute_signing_message_public;
 use axiom_core_logic::genesis::compute_genesis_state_id;
 use axiom_core_logic::wallet_id::{K_DEFAULT, PROOF_TYPE_DMAP};
 use axiom_test_utils::TestWallet;
-use ed25519_dalek::{Signer, Verifier, VerifyingKey};
+use ed25519_dalek::Signer;
 
 // ============================================================
-// 1. Owner proof derivation consistency
-// ============================================================
-
-#[test]
-fn test_same_secret_always_produces_same_auth_hash() {
-    let secret = b"deterministic-password-42";
-    let hash1 = derive_owner_pubkey(secret);
-    let hash2 = derive_owner_pubkey(secret);
-    let hash3 = derive_owner_pubkey(secret);
-    assert_eq!(hash1, hash2);
-    assert_eq!(hash2, hash3);
-}
-
-#[test]
-fn test_same_secret_always_produces_same_keypair() {
-    let secret = b"stable-key-material";
-    let (sk1, vk1) = derive_owner_keypair(secret);
-    let (sk2, vk2) = derive_owner_keypair(secret);
-    assert_eq!(sk1.to_bytes(), sk2.to_bytes());
-    assert_eq!(vk1.to_bytes(), vk2.to_bytes());
-}
-
-#[test]
-fn test_derive_owner_pubkey_matches_keypair_vk() {
-    let secret = b"consistency-check";
-    let pubkey = derive_owner_pubkey(secret);
-    let (_, vk) = derive_owner_keypair(secret);
-    assert_eq!(pubkey, *vk.as_bytes(),
-        "derive_owner_pubkey must return the verifying key from derive_owner_keypair");
-}
-
-// ============================================================
-// 2. Different passwords produce different keys (collision resistance)
-// ============================================================
-
-#[test]
-fn test_different_passwords_different_auth_hashes() {
-    let passwords: Vec<&[u8]> = vec![
-        b"password1", b"password2", b"password3",
-        b"Password1", b"PASSWORD1", b" password1",
-        b"password1 ", b"\x00password1", b"password1\x00",
-    ];
-    let hashes: Vec<[u8; 32]> = passwords.iter()
-        .map(|p| derive_owner_pubkey(p))
-        .collect();
-
-    for i in 0..hashes.len() {
-        for j in (i + 1)..hashes.len() {
-            assert_ne!(hashes[i], hashes[j],
-                "Collision between password {:?} and {:?}",
-                passwords[i], passwords[j]);
-        }
-    }
-}
-
-#[test]
-fn test_single_bit_difference_produces_different_keys() {
-    // Two secrets differing by exactly 1 bit must produce entirely different keys
-    let secret_a = [0xABu8; 32];
-    let mut secret_b = secret_a;
-    secret_b[15] ^= 0x01; // flip one bit
-
-    let (_, vk_a) = derive_owner_keypair(&secret_a);
-    let (_, vk_b) = derive_owner_keypair(&secret_b);
-    assert_ne!(vk_a.to_bytes(), vk_b.to_bytes(),
-        "Single-bit secret difference must produce different keys (avalanche)");
-}
-
-#[test]
-fn test_empty_vs_nonempty_secret() {
-    let hash_empty = derive_owner_pubkey(b"");
-    let hash_nonempty = derive_owner_pubkey(b"x");
-    assert_ne!(hash_empty, hash_nonempty);
-}
-
-#[test]
-fn test_null_byte_padding_attack() {
-    // Attacker tries to find collisions by appending null bytes
-    let hash_a = derive_owner_pubkey(b"secret");
-    let hash_b = derive_owner_pubkey(b"secret\x00");
-    let hash_c = derive_owner_pubkey(b"secret\x00\x00");
-    assert_ne!(hash_a, hash_b, "Null-byte suffix must not collide");
-    assert_ne!(hash_b, hash_c, "Different null-byte suffixes must not collide");
-    assert_ne!(hash_a, hash_c);
-}
-
-// ============================================================
-// 3. Key derivation is not trivially reversible
-// ============================================================
-
-#[test]
-fn test_derived_key_is_not_raw_password_bytes() {
-    let secret = [0x42u8; 32];
-    let pubkey = derive_owner_pubkey(&secret);
-    assert_ne!(pubkey, secret,
-        "Derived pubkey must not equal raw password bytes");
-
-    let (sk, _) = derive_owner_keypair(&secret);
-    assert_ne!(sk.to_bytes(), secret,
-        "Derived signing key must not equal raw password bytes");
-}
-
-#[test]
-fn test_derived_key_not_simple_hash_of_secret() {
-    // Ensure the derivation uses domain separation, not just SHA3-256(secret)
-    let secret = b"test-secret-for-domain-check";
-    let (sk, _) = derive_owner_keypair(secret);
-
-    // Direct SHA3-256 of secret (without domain tag) should NOT equal the signing key seed
-    use tiny_keccak::{Hasher, Sha3};
-    let mut hasher = Sha3::v256();
-    hasher.update(secret);
-    let mut direct_hash = [0u8; 32];
-    hasher.finalize(&mut direct_hash);
-    assert_ne!(sk.to_bytes(), direct_hash,
-        "Derivation must use domain separation ('AXIOM_OWNER_KEY' prefix)");
-}
-
-#[test]
-fn test_derived_key_uses_domain_tag() {
-    // Verify that the AXIOM_OWNER_KEY domain tag is actually used:
-    // SHA3-256("AXIOM_OWNER_KEY" || secret) should match the signing key seed
-    let secret = b"verify-domain-tag";
-
-    use tiny_keccak::{Hasher, Sha3};
-    let mut hasher = Sha3::v256();
-    hasher.update(b"AXIOM_OWNER_KEY");
-    hasher.update(secret.as_ref());
-    let mut expected_seed = [0u8; 32];
-    hasher.finalize(&mut expected_seed);
-
-    let (sk, _) = derive_owner_keypair(secret);
-    assert_eq!(sk.to_bytes(), expected_seed,
-        "Derivation must be SHA3-256('AXIOM_OWNER_KEY' || secret)");
-}
-
-#[test]
-fn test_pubkey_is_32_bytes_valid_ed25519() {
-    // Owner pubkey stored as auth_hash must be a valid Ed25519 point
-    let secret = b"valid-point-check";
-    let pubkey_bytes = derive_owner_pubkey(secret);
-
-    // Must parse as a valid Ed25519 verifying key (on the curve)
-    let vk = VerifyingKey::from_bytes(&pubkey_bytes);
-    assert!(vk.is_ok(), "auth_hash must be a valid Ed25519 public key (on curve)");
-}
-
-// ============================================================
-// 4. Transaction signing message covers ALL critical fields
+// 1. Transaction signing message covers ALL critical fields
 // ============================================================
 
 fn make_base_tx() -> Transaction {
@@ -191,7 +43,6 @@ fn make_base_tx() -> Transaction {
         nonce: 42,
         epoch: 100,
         client_sig: vec![],
-        owner_proof: None,
         scar_passcode: None,
         burn_target_tx_id: None,
         oracle_claim: None,
@@ -296,97 +147,7 @@ fn test_protocol_version_bound_in_signing_message() {
 }
 
 // ============================================================
-// 5. Owner proof: signature validity and binding
-// ============================================================
-
-#[test]
-fn test_owner_proof_signature_verifies_with_derived_pubkey() {
-    let secret = b"owner-secret-12345";
-    let (_, vk) = derive_owner_keypair(secret);
-    let tx = make_base_tx();
-    let proof = sign_owner_proof(secret, &tx);
-
-    // Reconstruct the message the verifier checks
-    let signing_msg = compute_signing_message_public(&tx);
-    let owner_msg = blake3::hash(
-        &[b"AXIOM_OWNER_SIG" as &[u8], signing_msg.as_slice()].concat()
-    );
-
-    let sig = ed25519_dalek::Signature::from_bytes(
-        proof.as_slice().try_into().expect("proof must be 64 bytes")
-    );
-    assert!(vk.verify(owner_msg.as_bytes(), &sig).is_ok(),
-        "Owner proof must verify against derived pubkey");
-}
-
-#[test]
-fn test_owner_proof_wrong_secret_does_not_verify() {
-    let real_secret = b"real-owner-secret";
-    let wrong_secret = b"attacker-guess";
-    let tx = make_base_tx();
-
-    // Sign with real secret
-    let proof = sign_owner_proof(real_secret, &tx);
-
-    // Try to verify with wrong secret's pubkey
-    let (_, wrong_vk) = derive_owner_keypair(wrong_secret);
-    let signing_msg = compute_signing_message_public(&tx);
-    let owner_msg = blake3::hash(
-        &[b"AXIOM_OWNER_SIG" as &[u8], signing_msg.as_slice()].concat()
-    );
-    let sig = ed25519_dalek::Signature::from_bytes(
-        proof.as_slice().try_into().unwrap()
-    );
-    assert!(wrong_vk.verify(owner_msg.as_bytes(), &sig).is_err(),
-        "Owner proof signed by one secret must NOT verify against different secret's pubkey");
-}
-
-#[test]
-fn test_owner_proof_binds_to_transaction_fields() {
-    let secret = b"binding-test";
-    let tx1 = make_base_tx();
-    let mut tx2 = make_base_tx();
-    tx2.amount = 99_999_999;
-
-    let proof1 = sign_owner_proof(secret, &tx1);
-    let proof2 = sign_owner_proof(secret, &tx2);
-    assert_ne!(proof1, proof2,
-        "Owner proof must change when transaction fields change");
-
-    // proof1 must NOT verify against tx2's signing message
-    let (_, vk) = derive_owner_keypair(secret);
-    let signing_msg2 = compute_signing_message_public(&tx2);
-    let owner_msg2 = blake3::hash(
-        &[b"AXIOM_OWNER_SIG" as &[u8], signing_msg2.as_slice()].concat()
-    );
-    let sig1 = ed25519_dalek::Signature::from_bytes(
-        proof1.as_slice().try_into().unwrap()
-    );
-    assert!(vk.verify(owner_msg2.as_bytes(), &sig1).is_err(),
-        "Owner proof from tx1 must NOT verify against tx2 (prevents proof replay across TXs)");
-}
-
-#[test]
-fn test_owner_proof_is_64_bytes() {
-    let secret = b"size-check";
-    let tx = make_base_tx();
-    let proof = sign_owner_proof(secret, &tx);
-    assert_eq!(proof.len(), 64, "Owner proof must be exactly 64 bytes (Ed25519 signature)");
-}
-
-#[test]
-fn test_owner_proof_not_raw_secret() {
-    // The old (pre-audit) mechanism leaked the raw secret as owner_proof.
-    // Verify the proof never contains the raw secret bytes.
-    let secret = b"must-not-leak-this-secret-value!";
-    let tx = make_base_tx();
-    let proof = sign_owner_proof(secret, &tx);
-    assert_ne!(&proof[..secret.len().min(64)], &secret[..secret.len().min(64)],
-        "Owner proof must NOT contain raw secret bytes (zero-knowledge property)");
-}
-
-// ============================================================
-// 6. Genesis state_id determinism and binding
+// 2. Genesis state_id determinism and binding
 // ============================================================
 
 #[test]
@@ -422,7 +183,7 @@ fn test_genesis_state_id_is_32_bytes() {
 }
 
 // ============================================================
-// 7. Cross-validation: webclient signing matches Core verification
+// 3. Cross-validation: webclient signing matches Core verification
 // ============================================================
 
 #[test]
@@ -474,7 +235,7 @@ fn test_webclient_signing_message_with_burn_target_matches_core() {
 }
 
 // ============================================================
-// 8. Adversarial field-swapping attacks on signing message
+// 4. Adversarial field-swapping attacks on signing message
 // ============================================================
 
 #[test]
@@ -540,84 +301,7 @@ fn test_reference_field_boundary_attack() {
 }
 
 // ============================================================
-// 9. Owner proof replay attack resistance
-// ============================================================
-
-#[test]
-fn test_owner_proof_cannot_replay_to_different_receiver() {
-    let secret = b"anti-replay-secret";
-    let mut tx_legit = make_base_tx();
-    tx_legit.receiver_wallet_id = "friend@example.com/abcdef0042".to_string();
-
-    let mut tx_evil = make_base_tx();
-    tx_evil.receiver_wallet_id = "thief@evil.com/deadbeef42".to_string();
-
-    let proof_legit = sign_owner_proof(secret, &tx_legit);
-    let proof_evil = sign_owner_proof(secret, &tx_evil);
-
-    assert_ne!(proof_legit, proof_evil,
-        "Owner proof must differ when receiver changes (anti-fund-redirection)");
-
-    // Verify the legit proof does NOT verify against the evil tx
-    let (_, vk) = derive_owner_keypair(secret);
-    let evil_signing_msg = compute_signing_message_public(&tx_evil);
-    let evil_owner_msg = blake3::hash(
-        &[b"AXIOM_OWNER_SIG" as &[u8], evil_signing_msg.as_slice()].concat()
-    );
-    let sig = ed25519_dalek::Signature::from_bytes(
-        proof_legit.as_slice().try_into().unwrap()
-    );
-    assert!(vk.verify(evil_owner_msg.as_bytes(), &sig).is_err(),
-        "Legitimate owner proof must NOT verify against modified receiver");
-}
-
-#[test]
-fn test_owner_proof_cannot_replay_to_different_amount() {
-    let secret = b"amount-binding";
-    let mut tx_small = make_base_tx();
-    tx_small.amount = 500_000;
-
-    let mut tx_big = make_base_tx();
-    tx_big.amount = 999_999_999;
-
-    let proof_small = sign_owner_proof(secret, &tx_small);
-
-    let (_, vk) = derive_owner_keypair(secret);
-    let big_signing_msg = compute_signing_message_public(&tx_big);
-    let big_owner_msg = blake3::hash(
-        &[b"AXIOM_OWNER_SIG" as &[u8], big_signing_msg.as_slice()].concat()
-    );
-    let sig = ed25519_dalek::Signature::from_bytes(
-        proof_small.as_slice().try_into().unwrap()
-    );
-    assert!(vk.verify(big_owner_msg.as_bytes(), &sig).is_err(),
-        "Owner proof for small amount must NOT verify against large amount TX");
-}
-
-#[test]
-fn test_owner_proof_cannot_replay_across_wallet_seq() {
-    let secret = b"seq-binding";
-    let mut tx1 = make_base_tx();
-    tx1.wallet_seq = 1;
-    let mut tx2 = make_base_tx();
-    tx2.wallet_seq = 2;
-
-    let proof1 = sign_owner_proof(secret, &tx1);
-
-    let (_, vk) = derive_owner_keypair(secret);
-    let msg2 = compute_signing_message_public(&tx2);
-    let owner_msg2 = blake3::hash(
-        &[b"AXIOM_OWNER_SIG" as &[u8], msg2.as_slice()].concat()
-    );
-    let sig = ed25519_dalek::Signature::from_bytes(
-        proof1.as_slice().try_into().unwrap()
-    );
-    assert!(vk.verify(owner_msg2.as_bytes(), &sig).is_err(),
-        "Owner proof must NOT replay across different wallet_seq values");
-}
-
-// ============================================================
-// 10. End-to-end: webclient-style TX accepted by Core
+// 5. End-to-end: webclient-style TX accepted by Core
 // ============================================================
 
 #[test]
@@ -643,7 +327,6 @@ fn test_webclient_style_tx_accepted_by_core_validation() {
         nonce: 0,
         epoch: 0,
         client_sig: vec![],
-        owner_proof: None,
         scar_passcode: None,
         burn_target_tx_id: None,
         oracle_claim: None,
@@ -669,22 +352,29 @@ fn test_webclient_style_tx_accepted_by_core_validation() {
     let sig = alice.signing_key.sign(&sign_msg);
     tx.client_sig = sig.to_bytes().to_vec();
 
-    // Add owner_proof (webclient always does this since v2.11.13)
-    let auth_hash = derive_owner_pubkey(&alice.wallet_secret);
-    tx.owner_proof = Some(sign_owner_proof(&alice.wallet_secret, &tx));
-
     let state = WalletState {
+        wall_clock_lock: 0,
+        emission_claimed_epoch: 0,
+        stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         hibernation_until: 0,
         public_key: alice.verifying_key.to_bytes().to_vec(),
         balance: alice.balance,
         wallet_seq: 0,
         state_id: alice.state_id,
-        auth_hash: Some(auth_hash),
+        auth_hash: None,
         wallet_id: None,
         group_members: None,
     };
 
     let inputs = PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        claimant_vbc: None,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
         oods_attestation: None,
         recall_attestation: None,
         receiver_current_hibernation: None,
@@ -703,6 +393,8 @@ fn test_webclient_style_tx_accepted_by_core_validation() {
         overlapped_signatures: vec![],
         group_member_index: None,
         sender_fact_chain: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         receiver_fact_chain: None,
         my_dilithium_sk: None,
         my_dilithium_pk: None,
@@ -711,15 +403,11 @@ fn test_webclient_style_tx_accepted_by_core_validation() {
         issuer_sphincs_sk: None,
         cl1_execution_proof: None,
         zkp_nonce: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
         audit_confirmation: None,
         nonce_response: None,
         audit_response: None,
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -733,7 +421,6 @@ fn test_webclient_style_tx_accepted_by_core_validation() {
         phase_out_era_end_ticks: vec![],
         phase_out_blocked_era_ids: vec![],
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         max_fact_links: None,
         current_tick: 0,
     
@@ -741,240 +428,6 @@ fn test_webclient_style_tx_accepted_by_core_validation() {
 
     let result = execute_core(inputs);
     assert_eq!(result.result, ValidationResult::Accept,
-        "Webclient-style signed TX (manual msg + owner_proof) must be accepted by Core. \
+        "Webclient-style signed TX (manual signing message) must be accepted by Core. \
          Rejection: {:?}", result.rejection_reason);
-}
-
-// ============================================================
-// 11. Adversarial: tampered owner_proof rejected by Core
-// ============================================================
-
-#[test]
-fn test_tampered_owner_proof_rejected_by_core() {
-    use axiom_core_logic::types::{PublicInputs, CoreLogicMode, ValidationResult, ValidationError};
-    use axiom_core_logic::modes::execute_core;
-
-    let alice = TestWallet::generate("alice@tamper.test", 10_000_000);
-    let bob = TestWallet::generate("bob@tamper.test", 0);
-
-    let mut tx = Transaction {
-        recall_target_tx_id: None,
-        consumed_state_id: alice.state_id,
-        client_pk: alice.verifying_key.to_bytes().to_vec(),
-        sender_wallet_id: alice.address(),
-        wallet_seq: 1,
-        receiver_wallet_id: bob.address(),
-        receiver_address: None,
-        core_id: [0u8; 32],
-        amount: 500_000,
-        reference: String::new(),
-        nonce: 0,
-        epoch: 0,
-        client_sig: vec![],
-        owner_proof: None,
-        scar_passcode: None,
-        burn_target_tx_id: None,
-        oracle_claim: None,
-        required_k: 0,
-        proof_type: 0,
-        core_version: String::new(),
-        kind: TxKind::Normal,
-    };
-
-    // Valid client signature
-    let sign_msg = compute_signing_message_public(&tx);
-    let sig = alice.signing_key.sign(&sign_msg);
-    tx.client_sig = sig.to_bytes().to_vec();
-
-    // Valid auth_hash but TAMPERED owner_proof (flip one bit)
-    let auth_hash = derive_owner_pubkey(&alice.wallet_secret);
-    let mut proof = sign_owner_proof(&alice.wallet_secret, &tx);
-    proof[0] ^= 0x01; // flip one bit
-    tx.owner_proof = Some(proof);
-
-    let state = WalletState {
-        hibernation_until: 0,
-        public_key: alice.verifying_key.to_bytes().to_vec(),
-        balance: alice.balance,
-        wallet_seq: 0,
-        state_id: alice.state_id,
-        auth_hash: Some(auth_hash),
-        wallet_id: None,
-        group_members: None,
-    };
-
-    let inputs = PublicInputs {
-        oods_attestation: None,
-        recall_attestation: None,
-        receiver_current_hibernation: None,
-        mode: CoreLogicMode::CL1,
-        transaction: tx,
-        current_state: Some(state),
-        prev_receipts: vec![],
-        vbc_bundle: None,
-        cheque_bundle: None,
-        receiver_pk: None,
-        receiver_current_balance: None,
-        receiver_wallet_seq: None,
-        receiver_new_balance: None,
-        receiver_new_state_id: None,
-        my_validator_pk: None,
-        overlapped_signatures: vec![],
-        group_member_index: None,
-        sender_fact_chain: None,
-        receiver_fact_chain: None,
-        my_dilithium_sk: None,
-        my_dilithium_pk: None,
-        my_validator_id: None,
-        fact_witness_sigs: vec![],
-        issuer_sphincs_sk: None,
-        cl1_execution_proof: None,
-        zkp_nonce: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
-        audit_confirmation: None,
-        nonce_response: None,
-        audit_response: None,
-        wallet_secret: None,
-        fanout_message: None,
-        candidate_balance: None,
-        nabla_stake_proof: None,
-        frozen_wallets: None,
-        console_current_cert: None,
-        console_new_cert: None,
-        console_selector_picks: None,
-        console_nominations: None,
-        txid_attestation: None,
-        cheque_claim_proof: None,
-        clara_attestation: None,
-        phase_out_payload: None,
-        phase_out_era_end_ticks: vec![],
-        phase_out_blocked_era_ids: vec![],
-        local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
-        max_fact_links: None,
-        current_tick: 0,
-    
-    };
-
-    let result = execute_core(inputs);
-    assert_ne!(result.result, ValidationResult::Accept,
-        "Tampered owner_proof must be rejected by Core");
-    assert_eq!(result.rejection_reason, Some(ValidationError::InvalidAuthProof),
-        "Rejection must be InvalidAuthProof for tampered owner_proof");
-}
-
-// ============================================================
-// 12. Adversarial: missing owner_proof when auth_hash is set
-// ============================================================
-
-#[test]
-fn test_missing_owner_proof_rejected_when_auth_hash_set() {
-    use axiom_core_logic::types::{PublicInputs, CoreLogicMode, ValidationResult, ValidationError};
-    use axiom_core_logic::modes::execute_core;
-
-    let alice = TestWallet::generate("alice@missing-proof.test", 10_000_000);
-    let bob = TestWallet::generate("bob@missing-proof.test", 0);
-
-    let mut tx = Transaction {
-        recall_target_tx_id: None,
-        consumed_state_id: alice.state_id,
-        client_pk: alice.verifying_key.to_bytes().to_vec(),
-        sender_wallet_id: alice.address(),
-        wallet_seq: 1,
-        receiver_wallet_id: bob.address(),
-        receiver_address: None,
-        core_id: [0u8; 32],
-        amount: 500_000,
-        reference: String::new(),
-        nonce: 0,
-        epoch: 0,
-        client_sig: vec![],
-        owner_proof: None, // deliberately missing
-        scar_passcode: None,
-        burn_target_tx_id: None,
-        oracle_claim: None,
-        required_k: 0,
-        proof_type: 0,
-        core_version: String::new(),
-        kind: TxKind::Normal,
-    };
-
-    let sign_msg = compute_signing_message_public(&tx);
-    let sig = alice.signing_key.sign(&sign_msg);
-    tx.client_sig = sig.to_bytes().to_vec();
-
-    let auth_hash = derive_owner_pubkey(&alice.wallet_secret);
-    let state = WalletState {
-        hibernation_until: 0,
-        public_key: alice.verifying_key.to_bytes().to_vec(),
-        balance: alice.balance,
-        wallet_seq: 0,
-        state_id: alice.state_id,
-        auth_hash: Some(auth_hash), // auth_hash IS set, but proof missing
-        wallet_id: None,
-        group_members: None,
-    };
-
-    let inputs = PublicInputs {
-        oods_attestation: None,
-        recall_attestation: None,
-        receiver_current_hibernation: None,
-        mode: CoreLogicMode::CL1,
-        transaction: tx,
-        current_state: Some(state),
-        prev_receipts: vec![],
-        vbc_bundle: None,
-        cheque_bundle: None,
-        receiver_pk: None,
-        receiver_current_balance: None,
-        receiver_wallet_seq: None,
-        receiver_new_balance: None,
-        receiver_new_state_id: None,
-        my_validator_pk: None,
-        overlapped_signatures: vec![],
-        group_member_index: None,
-        sender_fact_chain: None,
-        receiver_fact_chain: None,
-        my_dilithium_sk: None,
-        my_dilithium_pk: None,
-        my_validator_id: None,
-        fact_witness_sigs: vec![],
-        issuer_sphincs_sk: None,
-        cl1_execution_proof: None,
-        zkp_nonce: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
-        audit_confirmation: None,
-        nonce_response: None,
-        audit_response: None,
-        wallet_secret: None,
-        fanout_message: None,
-        candidate_balance: None,
-        nabla_stake_proof: None,
-        frozen_wallets: None,
-        console_current_cert: None,
-        console_new_cert: None,
-        console_selector_picks: None,
-        console_nominations: None,
-        txid_attestation: None,
-        cheque_claim_proof: None,
-        clara_attestation: None,
-        phase_out_payload: None,
-        phase_out_era_end_ticks: vec![],
-        phase_out_blocked_era_ids: vec![],
-        local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
-        max_fact_links: None,
-        current_tick: 0,
-    
-    };
-
-    let result = execute_core(inputs);
-    assert_ne!(result.result, ValidationResult::Accept,
-        "Missing owner_proof when auth_hash is set must be rejected");
-    assert_eq!(result.rejection_reason, Some(ValidationError::AuthHashRequired),
-        "Rejection must be AuthHashRequired for missing owner_proof");
 }

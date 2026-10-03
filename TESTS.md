@@ -3,6 +3,13 @@
 **Version:** 2.0.0  
 **Last Updated:** 2026-01-31
 
+**STATUS (2026-08-31): STALE SNAPSHOT — the per-file inventory below reflects
+the 2026-01-31 tree and the counts and layout have drifted substantially since
+(the logic crate alone now carries several hundred tests, and the directory
+names changed: `logic/` not `core/src`). For the live way to run and count the
+suites, use `VERIFYING.md` §1; treat this document as historical orientation,
+not a current inventory.**
+
 This document describes all tests in axiom-core and what they verify.
 
 ---

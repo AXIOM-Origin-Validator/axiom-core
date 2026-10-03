@@ -49,7 +49,7 @@ fn make_signed_link(
     keys: &[DilithiumTestKey],
 ) -> FactLink {
     let commitment = axiom_core_logic::compute::compute_fact_commitment(
-        &tx_id, &prev_state, &new_state, amount, None, false,
+        &tx_id, &prev_state, &new_state, amount, None, false, keys.len() as u8, &[], None,
     );
     let witnesses: Vec<FactWitness> = keys
         .iter()
@@ -67,7 +67,7 @@ fn make_signed_link(
                 validator_id: vid,
                 validator_pk: key.pk.clone(),
                 signature: sig,
-                vbc_genesis_anchor: None,
+                vbc_hash: [0u8; 32],
             }
         })
         .collect();
@@ -93,11 +93,15 @@ fn make_signed_link(
         tick: 0,
         witnesses,
         nabla_confirmation,
-        receiver_contact: None,
         burn_proof: None,
         sender_anchor: None,
         is_dev_class: false,
         recall_proof: None,
+        out_of_order_confirmation: None,
+        burn_target_tx_id: None,
+        inherited_scar_txids: Vec::new(),
+        inherited_scar_resolutions: Vec::new(),
+        receiver_witness: None,
     }
 }
 
@@ -173,7 +177,6 @@ fn arb_transaction() -> impl Strategy<Value = Transaction> {
                     epoch,
                     wallet_seq,
                     client_sig: vec![0u8; 64],
-                    owner_proof: None,
                     scar_passcode: None,
                     burn_target_tx_id: None,
                     oracle_claim: None,
@@ -201,13 +204,13 @@ proptest! {
         amounts in pvec(1u64..1_000_000, 7..=12),
     ) {
         let keys = test_keys();
-        let validators: Vec<([u8; 32], &[u8], &[u8])> = keys
+        let validators: Vec<([u8; 32], &[u8], &[u8], [u8; 32])> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| {
                 let mut vid = [0u8; 32];
                 vid[0] = i as u8;
-                (vid, k.pk.as_slice(), k.sk.as_slice())
+                (vid, k.pk.as_slice(), k.sk.as_slice(), [0u8; 32])
             })
             .collect();
 
@@ -258,13 +261,13 @@ proptest! {
         scar_bits in pvec(any::<bool>(), 3..=8),
     ) {
         let keys = test_keys();
-        let validators: Vec<([u8; 32], &[u8], &[u8])> = keys
+        let validators: Vec<([u8; 32], &[u8], &[u8], [u8; 32])> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| {
                 let mut vid = [0u8; 32];
                 vid[0] = i as u8;
-                (vid, k.pk.as_slice(), k.sk.as_slice())
+                (vid, k.pk.as_slice(), k.sk.as_slice(), [0u8; 32])
             })
             .collect();
 
@@ -307,13 +310,13 @@ proptest! {
         link_count in 7usize..=12,
     ) {
         let keys = test_keys();
-        let validators: Vec<([u8; 32], &[u8], &[u8])> = keys
+        let validators: Vec<([u8; 32], &[u8], &[u8], [u8; 32])> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| {
                 let mut vid = [0u8; 32];
                 vid[0] = i as u8;
-                (vid, k.pk.as_slice(), k.sk.as_slice())
+                (vid, k.pk.as_slice(), k.sk.as_slice(), [0u8; 32])
             })
             .collect();
 
@@ -353,13 +356,13 @@ proptest! {
         scar_positions in pvec(any::<bool>(), 7..=10),
     ) {
         let keys = test_keys();
-        let validators: Vec<([u8; 32], &[u8], &[u8])> = keys
+        let validators: Vec<([u8; 32], &[u8], &[u8], [u8; 32])> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| {
                 let mut vid = [0u8; 32];
                 vid[0] = i as u8;
-                (vid, k.pk.as_slice(), k.sk.as_slice())
+                (vid, k.pk.as_slice(), k.sk.as_slice(), [0u8; 32])
             })
             .collect();
 

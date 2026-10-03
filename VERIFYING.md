@@ -26,7 +26,11 @@ cat artifacts/CORE_ID.txt
 
 The two values must match — and must match the CoreID published for the release
 you checked out (the git tag, e.g. `core-d0900069`). Every honest participant
-runs the same ELF; a divergent Core is rejected by the DMAP / zk-VM gate.
+runs the same ELF; a divergent Core produces a different CoreID and is
+rejected by the CoreID accept-set check at registration and consensus (the
+DMAP attestation and the zkVM checkpoint proof additionally attest execution
+of the canonical ELF — DMAP is attestation-by-re-execution, not a proof
+system, and the zkVM guest covers a checkpoint subset of Core).
 
 **Paper readers:** the release
 [`core-42285e6b`](https://github.com/AXIOM-Origin-Validator/axiom-core/releases/tag/core-42285e6b)
@@ -75,7 +79,7 @@ matches the released value, your Core is byte-identical to the network's.
 ## 3. Run the conformance vectors
 
 `tests/consensus_vectors.json` is a set of deterministic input/output pairs
-covering the CL1/CL2/CL5/CL11 execution modes, `wallet_id`, and owner-proof.
+covering the CL1/CL2/CL3/CL5/CL11 execution modes and owner-proof.
 
 Regenerate the vectors from the source you're auditing and diff:
 
@@ -84,10 +88,19 @@ cargo run -p axiom-core-logic --example generate_vectors --features dev-mode > /
 diff <(python3 -m json.tool tests/consensus_vectors.json) <(python3 -m json.tool /tmp/vectors.json)
 ```
 
-**Expected:** the only differences are **3 FACT-chain vectors** whose witness
-signatures are non-deterministic (an unseeded signing nonce — a known generator
-limitation, tracked). Every other vector must be byte-identical. A difference in
-any *other* vector means the consensus rules changed.
+**Expected (updated 2026-10-01):** the generator is fully deterministic — two
+runs are byte-identical. ~~The only differences are 3 FACT-chain vectors whose
+witness signatures are non-deterministic~~ (that was an unseeded keygen, fixed
+2026-08-01). One limit: the CL3 FACT vectors carry certificates signed by the
+network's root keys, and their witness keys are derived from the root SECRETS
+(so that no published vector is a usable credential). Without the root secrets
+the generator stops at those vectors — an auditor cannot regenerate them, only
+replay them with the runner below. To check that a corpus carries no usable
+credential, run the artifact gate:
+
+```bash
+cargo run --release -p axiom-core-logic --features dev-mode --example corpus_credential_gate -- tests/consensus_vectors.json
+```
 
 **Building a reimplementation?** `tests/run_conformance.py` feeds the same
 vectors to *any* binary that speaks the Core IPC protocol (CBOR frames over
@@ -95,11 +108,22 @@ stdin/stdout):
 
 ```bash
 python3 tests/run_conformance.py --core-bin ./your-core-implementation
+
+# The in-tree reference target to compare against:
+cargo build --release -p axiom-core-bin --features axiom-core-logic/dev-mode
+python3 tests/run_conformance.py --core-bin ./target/release/core-bin
 ```
 
-A third-party reimplementation that passes this suite is protocol-conformant
-for the covered modes — the same model as Ethereum's cross-client
-`ethereum/tests`. (Pre-mainnet note: release-profile builds of this repo
+**Read the runner's limits before you rely on it.** It compares the `result`
+field only — accept vs reject. It does not compare `rejection_reason`,
+`new_balance` or `produced_state_id`, though the corpus records expectations for
+all three, and it reports vectors without CBOR inputs as skipped rather than
+passed. A reimplementation that passes it agrees with the reference on the
+accept/reject decision for the covered modes; that is a necessary condition for
+conformance, not a sufficient one. The stronger check is the byte-level vector
+diff above.
+
+(Pre-mainnet note: release-profile builds of this repo
 deliberately fail while `WALLET_IDENTITY_KEY` is the dev key — a compile guard
 so nobody ships a release binary before the mainnet key ceremony. Use debug
 builds or `--features dev-mode` until then.)

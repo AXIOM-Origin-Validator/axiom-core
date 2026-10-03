@@ -23,6 +23,17 @@ use axiom_zk_vm::{ZkvmProver, ZkvmVerifier};
 
 fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
     PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        // §5.2.2b/c — fields added 2026-09-05. Same story as
+        // `recall_target_tx_id` below: this fixture guards the host<->guest
+        // CBOR contract, and a field addition that skips it silently disables
+        // the guard. A plain CL1 send is not a subsidy claim.
+        claimant_vbc: None,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
         mode: CoreLogicMode::CL1,
         transaction: Transaction {
             consumed_state_id: [0u8; 32],
@@ -36,7 +47,6 @@ fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
             nonce: 1,
             epoch: 1,
             client_sig: vec![0u8; 64],
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             required_k: 0,
@@ -45,6 +55,10 @@ fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
             core_version: String::new(),
             kind: TxKind::Normal,
             core_id: [0u8; 32],
+            // YPX-022 RECALL (2026-07-06) — field added, this fixture never
+            // updated, so the test stopped compiling and the host<->guest
+            // serialization contract it guards has been UNTESTED since.
+            recall_target_tx_id: None,
         },
         prev_receipts: vec![],
         current_state: Some(WalletState {
@@ -53,7 +67,10 @@ fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
             wallet_seq: 0,
             state_id: [0u8; 32],
             auth_hash: None,
+            wall_clock_lock: 0,
             // The field under test: None → host word-serde would OMIT it.
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
             group_members: None,
             hibernation_until: 0,
@@ -70,6 +87,8 @@ fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
         overlapped_signatures: vec![],
         group_member_index: None,
         sender_fact_chain: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         receiver_fact_chain: None,
         my_dilithium_sk: None,
         my_dilithium_pk: None,
@@ -81,12 +100,8 @@ fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
         audit_confirmation: None,
         nonce_response: None,
         audit_response: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -101,8 +116,13 @@ fn cl1_inputs_with_none_wallet_id() -> PublicInputs {
         phase_out_blocked_era_ids: vec![],
         current_tick: 0,
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         max_fact_links: None,
+        // Same stale-fixture class: RECALL (recall_attestation), YPX-021 OODS
+        // (oods_attestation) and the FOB fee-claim (fob_claim_attestation)
+        // each added an input this CL1 fixture does not exercise.
+        recall_attestation: None,
+        oods_attestation: None,
+        fob_claim_attestation: None,
     }
 }
 

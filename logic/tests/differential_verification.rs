@@ -23,6 +23,14 @@ use axiom_test_utils::TestWallet;
 /// Build a minimal CL1 PublicInputs from a wallet and transaction.
 fn build_cl1(wallet: &TestWallet, tx: axiom_core_logic::types::Transaction) -> PublicInputs {
     PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        claimant_vbc: None,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
         oods_attestation: None,
         recall_attestation: None,
         receiver_current_hibernation: None,
@@ -41,6 +49,8 @@ fn build_cl1(wallet: &TestWallet, tx: axiom_core_logic::types::Transaction) -> P
         overlapped_signatures: vec![],
         group_member_index: None,
         sender_fact_chain: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         receiver_fact_chain: None,
         my_dilithium_sk: None,
         my_dilithium_pk: None,
@@ -52,12 +62,8 @@ fn build_cl1(wallet: &TestWallet, tx: axiom_core_logic::types::Transaction) -> P
         audit_confirmation: None,
         nonce_response: None,
         audit_response: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -71,7 +77,6 @@ fn build_cl1(wallet: &TestWallet, tx: axiom_core_logic::types::Transaction) -> P
         phase_out_era_end_ticks: vec![],
         phase_out_blocked_era_ids: vec![],
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         max_fact_links: None,
         current_tick: 0,
     
@@ -308,12 +313,15 @@ fn build_corpus() -> Vec<TestVector> {
         });
     }
 
-    // ── 10. Self-send (same email, non-Ark) ────────────────────────────
+    // ── 10. Self-send — sending to your OWN address ────────────────────
+    //
+    // Ownness is an EXACT question (YP §11.9.1a, KI#51): canonicalise the
+    // spelling, exact-equal ⇒ self-send; otherwise regenerate the sender's own
+    // tier addresses from (email, salt, sender_pk) and compare exactly.
     {
         let w = alice.clone();
-        // Create a receiver with the same email as alice
-        let r = TestWallet::generate("alice@diff.com", 0);
-        let tx = w.create_transaction(&r.address(), 500_000, "self-send", 1000);
+        // The receiver IS the sender. Nothing else is a self-send.
+        let tx = w.create_transaction(&w.address(), 500_000, "self-send", 1000);
         let mut inputs = build_cl1(&w, tx);
         inputs.transaction.sender_wallet_id = w.address();
         w.sign_transaction(&mut inputs.transaction);
@@ -321,6 +329,45 @@ fn build_corpus() -> Vec<TestVector> {
             name: "self_send",
             expect_accept: false,
             expect_error: Some(ValidationError::SelfSendRejected),
+            build: Box::new(move || inputs.clone()),
+        });
+    }
+
+    // ── 10b. Same email, DIFFERENT keypair — NOT a self-send (KI#51) ───
+    //
+    // This vector previously WAS `self_send` and expected a Reject: it built a
+    // second wallet sharing alice's email and asserted the send was refused as
+    // a send-to-self. That encoded the pre-KI#51 behaviour, where ownness was
+    // decided by an 8-BIT `pk_bind` prefix that answered "own" for ~2.7% of
+    // unrelated pairs — so it was asserting the bug. KI#51 made the answer
+    // exact (2026-08-02) and this vector went red and stayed red for two days,
+    // because preflight's gates do not run core-logic integration tests.
+    //
+    // An email is not an identity; the keypair is. A different keypair is a
+    // different wallet, and refusing to pay it is the user-visible half of
+    // KI#51 (legitimate sends rejected as self-sends). Kept as the regression
+    // guard for that direction.
+    {
+        let w = alice.clone();
+        // KI#181: NOT `TestWallet::generate` — with the fixture's fixed salt two
+        // random same-email keys share an address with p = 1/256 (the checksum
+        // excludes the pk; only the 8-bit pk_bind differs), which made this
+        // `assert_ne!` a 1-in-256 flake. Deterministic search instead.
+        let r = (0u8..=255)
+            .map(|i| { let mut k = [0xB2u8; 32]; k[0] = i; TestWallet::from_ed25519_key("alice@diff.com", k, 0) })
+            .find(|c| c.address() != w.address())
+            .expect("256 distinct keys cannot all share one address");
+        assert_ne!(w.address(), r.address(),
+            "same email must still yield a distinct address — otherwise this \
+             vector is not testing what it claims");
+        let tx = w.create_transaction(&r.address(), 500_000, "same-email-other-key", 1000);
+        let mut inputs = build_cl1(&w, tx);
+        inputs.transaction.sender_wallet_id = w.address();
+        w.sign_transaction(&mut inputs.transaction);
+        corpus.push(TestVector {
+            name: "same_email_different_key_is_not_self_send",
+            expect_accept: true,
+            expect_error: None,
             build: Box::new(move || inputs.clone()),
         });
     }

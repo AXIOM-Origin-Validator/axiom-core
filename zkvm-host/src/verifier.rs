@@ -55,51 +55,18 @@ impl ZkvmVerifier {
         Self { expected_digest }
     }
 
-    /// Verify a receipt and extract outputs.
-    ///
-    /// Performs full RISC Zero STARK verification (requires `verify` feature).
-    pub fn verify(&self, receipt: &ZkvmReceipt) -> Result<PublicOutputs, ZkvmError> {
-        // First, check program digest matches
-        if receipt.program_digest != self.expected_digest {
-            return Err(ZkvmError::ProgramDigestMismatch);
-        }
-
-        self.verify_real(receipt)
-    }
-
-    /// Real verification using RISC Zero
-    #[cfg(feature = "verify")]
-    fn verify_real(&self, receipt: &ZkvmReceipt) -> Result<PublicOutputs, ZkvmError> {
-        // Deserialize the RISC Zero receipt from the seal
-        let risc0_receipt: Receipt = bincode::deserialize(&receipt.seal)
-            .map_err(|e| ZkvmError::InvalidReceipt(format!("Failed to deserialize receipt: {}", e)))?;
-
-        // Verify the cryptographic proof against expected IMAGE_ID
-        risc0_receipt.verify(self.expected_digest)
-            .map_err(|e| ZkvmError::VerificationFailed(format!("Proof verification failed: {}", e)))?;
-
-        // Verify journal integrity: the wrapper's journal must match the proven journal
-        if receipt.journal != risc0_receipt.journal.bytes {
-            return Err(ZkvmError::VerificationFailed(
-                "Journal mismatch: receipt journal does not match proven journal".to_string()
-            ));
-        }
-
-        // Decode the outputs from the journal
-        let outputs: PublicOutputs = risc0_receipt.journal.decode()
-            .map_err(|e| ZkvmError::InvalidReceipt(format!("Failed to decode outputs: {}", e)))?;
-
-        Ok(outputs)
-    }
-
-    /// Verification requires the `verify` feature.
-    #[cfg(not(feature = "verify"))]
-    fn verify_real(&self, _receipt: &ZkvmReceipt) -> Result<PublicOutputs, ZkvmError> {
-        Err(ZkvmError::VerificationFailed(
-            "Real verification requires the 'verify' feature. \
-             Compile with --features verify".to_string()
-        ))
-    }
+    // DELETED 2026-09-02: `verify()` and its `verify_real()` helpers (both cfg
+    // variants), the twin of the `ZkvmProver::prove()` deleted in cc3573ac.
+    // They decoded the journal as `PublicOutputs`, which no guest has committed
+    // since the checkpoint cutover — so proof_type==0 STARK verification could
+    // not succeed for ANY valid proof.
+    //
+    // Unlike prove(), this one had LIVE consensus-path callers (Nabla's
+    // registration witness check and Lambda's cheque redeem), so the ZKP tier
+    // was not merely dead — it was a path that always failed. Both are rewired
+    // to `verify_checkpoint()` below, which is byte-identical apart from the
+    // decoded type: same digest check, same STARK verification, same
+    // journal-integrity check.
 
     /// Verify a checkpoint receipt and extract ZkpCheckpointOutputs.
     pub fn verify_checkpoint(&self, receipt: &ZkvmReceipt) -> Result<ZkpCheckpointOutputs, ZkvmError> {
@@ -174,7 +141,12 @@ mod tests {
             seal: b"fake".to_vec(),
             program_digest: [0xFF; 32], // Wrong digest
         };
-        let result = verifier.verify(&receipt);
+        // Ported to verify_checkpoint 2026-09-02 with the deletion of verify().
+        // The property is unchanged: the digest gate runs BEFORE any STARK work,
+        // so a receipt claiming a foreign IMAGE_ID is refused outright — with a
+        // deliberately unverifiable seal here, reaching any other error would
+        // mean the digest check had been skipped.
+        let result = verifier.verify_checkpoint(&receipt);
         assert!(matches!(result, Err(ZkvmError::ProgramDigestMismatch)));
     }
 

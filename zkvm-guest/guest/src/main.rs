@@ -21,16 +21,25 @@
 //! # Software Crypto (runs in RISC-V, counted as cycles)
 //!
 //! - SHA3-256 for produced_state_id (tiny-keccak, protocol-defined)
-//! - BLAKE3 for zkp_nonce_hash, fact_commitment (protocol-defined)
-//! - Ed25519 derived key for auth_hash / owner_proof (see axiom_core_logic::owner_proof)
+//! - BLAKE3 for zkp_nonce_hash (protocol-defined, via Core's one builder)
 //!
 //! # Hash Function Rules
 //!
 //! Any hash that is CROSS-CHECKED by Lambda/Nabla MUST use the same function
 //! and domain tag as the protocol definition. Currently:
 //!   - zkp_nonce_hash: BLAKE3("AXIOM_ZKP_NONCE" || nonce) — verified by Lambda
-//!   - fact_commitment: BLAKE3("AXIOM_FACT" || ...) — verified by Lambda
 //!   - input_hash: SHA256 precompile (guest-internal, not cross-checked)
+//!
+//! ⚠ `fact_commitment` is NOT computed here (DELETED 2026-09-28, Fork Settlement
+//! §9b R35). This header used to claim "fact_commitment … — verified by Lambda":
+//! that was FALSE (a RULE 3 ghost). Lambda's checkpoint path sets it to `None`
+//! (`lambda/src/core_client.rs`), nothing in `lambda/` or `nabla/` reads a
+//! checkpoint's `fact_commitment`, and `differential_conformance` excludes it as
+//! passthrough. The hand-copied hash had also drifted from
+//! `fact::compute_fact_commitment` (it omitted is_dev_class, the inherited set,
+//! the burn target, and — from 2b-ii — required_k, which the guest cannot even
+//! obtain: `FactCargo` carries only the txid). The hash AND the always-`None`
+//! `ZkpCheckpointOutputs::fact_commitment` field were deleted together.
 
 #![no_main]
 #![no_std]
@@ -93,9 +102,6 @@ pub fn main() {
             buf.extend_from_slice(&state.wallet_seq.to_le_bytes());
             buf.extend_from_slice(&state.state_id);
         }
-        if let Some(ref proof) = inputs.transaction.owner_proof {
-            buf.extend_from_slice(proof);
-        }
         if let Some(ref nonce) = inputs.zkp_nonce {
             buf.extend_from_slice(nonce);
         }
@@ -111,39 +117,17 @@ pub fn main() {
     // 5a. ZKP nonce hash — BLAKE3, protocol-defined, cross-checked by Lambda
     //     Lambda recomputes BLAKE3("AXIOM_ZKP_NONCE" || nonce) at CL1 and CL5.
     if let Some(nonce) = inputs.zkp_nonce {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"AXIOM_ZKP_NONCE");
-        hasher.update(&nonce);
-        checkpoint.zkp_nonce_hash = Some(*hasher.finalize().as_bytes());
+        // Pattern 1 sweep — ONE builder, shared with the host VM and Lambda.
+        // This file's own header requires it; it used to hand-copy instead.
+        checkpoint.zkp_nonce_hash = Some(axiom_core_logic::compute::zkp_nonce_hash(&nonce));
     }
 
-    // 5b. FACT txid passthrough + fact_commitment binding
+    // 5b. FACT txid passthrough.
     //     fact_signature (3,309 bytes) is NOT inside the guest — host attaches post-proving.
+    //     No FACT commitment — see the header (R35): the hand copy that lived
+    //     here was unread by anyone and stale against Core's builder.
     if let Some(cargo) = fact_cargo {
         checkpoint.txid = cargo.txid;
-
-        // fact_commitment — BLAKE3, protocol-defined, cross-checked by Lambda.
-        // Must match compute_fact_commitment() in core/logic/src/fact.rs
-        // (AXIOM_FACT_v2 — sender_anchor included; None encodes as 32 zeros).
-        if let (Some(produced_sid), Some(txid)) = (checkpoint.produced_state_id, checkpoint.txid) {
-            // sender_anchor: extracted from cheque_bundle.fact_chain.tip()
-            // for redeem TXs; None (zeros) otherwise.
-            let sender_anchor: [u8; 32] = inputs
-                .cheque_bundle
-                .as_ref()
-                .and_then(|cb| cb.fact_chain.as_ref())
-                .and_then(|fc| fc.links.last())
-                .map(|l| l.new_state_id)
-                .unwrap_or([0u8; 32]);
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"AXIOM_FACT_v2");
-            hasher.update(&txid);
-            hasher.update(&inputs.transaction.consumed_state_id);
-            hasher.update(&produced_sid);
-            hasher.update(&inputs.transaction.amount.to_le_bytes());
-            hasher.update(&sender_anchor);
-            checkpoint.fact_commitment = Some(*hasher.finalize().as_bytes());
-        }
     }
 
     // 6. Commit checkpoint outputs to the journal

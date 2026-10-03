@@ -258,11 +258,191 @@ fn classify(
             Some(RecoveryHint::RetryDifferentValidator),
             None,
         ),
+        VBCUnusableSoon { .. } => (
+            error_code::E_VBC_UNUSABLE_SOON,
+            ErrorCategory::RecoverableDrift,
+            "Validator credential is too close to expiry to serve — renew or retry a fresher validator".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        VBCStaleAttestation { .. } => (
+            error_code::E_VBC_STALE_ATTESTATION,
+            ErrorCategory::RecoverableDrift,
+            "attested OODS reading is stale vs the wallet's last round — fetch a fresh reading".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        VBCLifetimeTooLong { .. } => (
+            error_code::E_VBC_LIFETIME_TOO_LONG,
+            // Malformed request (the requester chose an out-of-policy lifetime) —
+            // retrying identically will not help; the request must carry a shorter
+            // expires_at. No RecoveryHint fits "shorten the validity"; the message
+            // carries the fix.
+            ErrorCategory::Operational,
+            "requested VBC validity exceeds the maximum non-genesis lifetime — request a shorter expires_at".to_string(),
+            None,
+            None,
+        ),
         VBCNotYetValid { .. } => (
             error_code::E_VBC_NOT_YET_VALID,
             ErrorCategory::Operational,
             "Validator credential is not yet valid".to_string(),
             Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        // Q2-b renewal proof-of-validation. Operational, no RecoveryHint:
+        // retrying identically will not help — the renewal must carry a valid
+        // co-signed fresh receipt, and if the validator did no witnessing this
+        // term, the fix is to witness first, not to retry.
+        VbcRenewalNoProofOfWork => (
+            error_code::E_VBC_RENEWAL_NO_PROOF_OF_WORK,
+            ErrorCategory::Operational,
+            "VBC renewal must present a k-signed receipt this validator co-signed this term (proof of validation work) — witness a transaction, then renew".to_string(),
+            None,
+            None,
+        ),
+        VbcRenewalNotCoSigned => (
+            error_code::E_VBC_RENEWAL_NOT_CO_SIGNED,
+            ErrorCategory::Operational,
+            "the renewal proof receipt is not co-signed by this validator — present a receipt whose witness set carries this validator's key with a valid signature".to_string(),
+            None,
+            None,
+        ),
+        VbcRenewalWorkReceiptStale => (
+            error_code::E_VBC_RENEWAL_WORK_RECEIPT_STALE,
+            ErrorCategory::Operational,
+            "the renewal proof receipt does not post-date the current certificate (no OODS reading, or its tick is not newer than the cert) — present an online witnessed receipt from this term".to_string(),
+            None,
+            None,
+        ),
+        VbcRenewalWorkReceiptSubQuorum => (
+            error_code::E_VBC_RENEWAL_WORK_RECEIPT_SUB_QUORUM,
+            ErrorCategory::Operational,
+            "the renewal proof receipt does not carry a full witness quorum (fewer than 3 valid distinct signatures)".to_string(),
+            None,
+            None,
+        ),
+        // ValidatorJoin §5.2.2. RetryDifferentValidator, NOT WaitAndRetry:
+        // a provisional never becomes serviceable by waiting — it expires.
+        // The candidate's route forward is to complete its join and obtain a
+        // full VBC, which is not something the counterparty can wait out.
+        VBCProvisionalCannotServe { .. } => (
+            error_code::E_VBC_PROVISIONAL_CANNOT_SERVE,
+            ErrorCategory::ProtocolReject,
+            "Validator credential is provisional and confers no service rights".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        // ── §5.3 genesis-lineage admission ────────────────────────────────
+        // ProtocolReject, not RecoverableDrift: none of these is a timing or
+        // staleness problem the caller can wait out. The candidate must change
+        // its REQUEST — different issuers, the issuers' own certs included, a
+        // lineage one of them actually holds. `RetryDifferentValidator` is the
+        // honest hint for the issuer-shaped failures: swapping a meta is
+        // exactly the remedy, and §5.3 identifies a meta by the KEY that
+        // verifies its signature, not by its slot, so a refused third can be
+        // replaced with the first two signatures still good.
+        VBCNoAttestedTick => (
+            error_code::E_VBC_NO_ATTESTED_TICK,
+            ErrorCategory::Operational,
+            "No attested tick — the certificate issuing bar cannot be judged".to_string(),
+            Some(RecoveryHint::WaitAndRetry),
+            None,
+        ),
+        VBCIssuerCertMissing => (
+            error_code::E_VBC_ISSUER_CERT_MISSING,
+            ErrorCategory::ProtocolReject,
+            "An issuer's own certificate is missing from the request".to_string(),
+            None,
+            None,
+        ),
+        VBCIssuerCannotIssue => (
+            error_code::E_VBC_ISSUER_CANNOT_ISSUE,
+            ErrorCategory::ProtocolReject,
+            "An issuer has too little remaining life to admit a newcomer".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        VBCIssuerNoLineage => (
+            error_code::E_VBC_ISSUER_NO_LINEAGE,
+            ErrorCategory::ProtocolReject,
+            "An issuer belongs to no genesis lineage".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        VBCIssuersShareLineage => (
+            error_code::E_VBC_ISSUERS_SHARE_LINEAGE,
+            ErrorCategory::ProtocolReject,
+            "Two issuers share one genesis lineage — three different families are required".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        VBCLineageNotAdopted => (
+            error_code::E_VBC_LINEAGE_NOT_ADOPTED,
+            ErrorCategory::ProtocolReject,
+            "The certificate's genesis lineage is not one of its issuers'".to_string(),
+            None,
+            None,
+        ),
+        // ── CL8 certificate issuance ──────────────────────────────────────
+        // The three Core-fault arms (key unusable / signing failed /
+        // verify-after-sign) are Internal, NOT ProtocolReject: nothing the
+        // candidate sent is wrong, so telling it to change its request would
+        // send it chasing a defect on the issuer's side.
+        Cl8MissingBundle => (
+            error_code::E_CL8_MISSING_BUNDLE,
+            ErrorCategory::ProtocolReject,
+            "Certificate signing called with no certificate".to_string(),
+            None,
+            None,
+        ),
+        Cl8MissingIssuerKey => (
+            error_code::E_CL8_MISSING_ISSUER_KEY,
+            ErrorCategory::Internal,
+            "Certificate signing called with no issuer key".to_string(),
+            None,
+            None,
+        ),
+        Cl8SignerNotInIssuerSet => (
+            error_code::E_CL8_SIGNER_NOT_IN_ISSUER_SET,
+            ErrorCategory::ProtocolReject,
+            "This validator is not among the certificate's declared issuers".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        Cl8ProvisionalLifetimeInvalid => (
+            error_code::E_CL8_PROVISIONAL_LIFETIME_INVALID,
+            ErrorCategory::ProtocolReject,
+            "Certificate lifetime is zero or runs backwards".to_string(),
+            None,
+            None,
+        ),
+        Cl8IssuerKeyUnusable => (
+            error_code::E_CL8_ISSUER_KEY_UNUSABLE,
+            ErrorCategory::Internal,
+            "Issuer signing key is malformed".to_string(),
+            None,
+            None,
+        ),
+        Cl8SigningFailed => (
+            error_code::E_CL8_SIGNING_FAILED,
+            ErrorCategory::Internal,
+            "Certificate signing failed".to_string(),
+            None,
+            None,
+        ),
+        Cl8OodsStampMismatch => (
+            error_code::E_CL8_OODS_STAMP_MISMATCH,
+            ErrorCategory::ProtocolReject,
+            "Certificate OODS stamp disagrees with the attestation supplied".to_string(),
+            None,
+            None,
+        ),
+        Cl8VerifyAfterSignFailed => (
+            error_code::E_CL8_VERIFY_AFTER_SIGN_FAILED,
+            ErrorCategory::Internal,
+            "Certificate signature did not verify after signing".to_string(),
+            None,
             None,
         ),
         VBCChainTooDeep => (
@@ -283,6 +463,13 @@ fn classify(
             error_code::E_VBC_ROOT_KEY_MISMATCH,
             ErrorCategory::RecoverableDrift,
             "Validator credential root key does not match trust anchor".to_string(),
+            Some(RecoveryHint::RetryDifferentValidator),
+            None,
+        ),
+        GenesisNameReserved => (
+            error_code::E_GENESIS_NAME_RESERVED,
+            ErrorCategory::RecoverableDrift,
+            "Genesis validator name is reserved to its pinned genesis key".to_string(),
             Some(RecoveryHint::RetryDifferentValidator),
             None,
         ),
@@ -411,6 +598,42 @@ fn classify(
             None,
             None,
         ),
+        // YP §26.17.6.5 FACT Provenance Binding (2026-09-11, KI#145)
+        FactWitnessUncertified => (
+            error_code::E_FACT_WITNESS_UNCERTIFIED,
+            ErrorCategory::ClientBug,
+            "FACT witness resolves to no presented, verified certificate (or its keys differ) — present the witnessing validators' certificate bundles with the chain; Core never fetches them".to_string(),
+            None,
+            Some("§26.17.6.5"),
+        ),
+        FactOriginInvalid => (
+            error_code::E_FACT_ORIGIN_INVALID,
+            ErrorCategory::ClientBug,
+            "FACT chain does not start at the wallet's derived opening state".to_string(),
+            None,
+            Some("§26.17.6.5"),
+        ),
+        FactCertificateInvalid => (
+            error_code::E_FACT_CERTIFICATE_INVALID,
+            ErrorCategory::ClientBug,
+            "a presented FACT certificate bundle does not verify to this network's roots".to_string(),
+            None,
+            Some("§26.17.6.5"),
+        ),
+        FactBurnSigInvalid => (
+            error_code::E_FACT_BURN_SIG_INVALID,
+            ErrorCategory::ClientBug,
+            "burn proof signature is not one of the burn link's verified witnesses".to_string(),
+            None,
+            Some("§26.17.6.5"),
+        ),
+        StakeClaimTierInvalid => (
+            error_code::E_STAKE_CLAIM_TIER_INVALID,
+            ErrorCategory::ProtocolReject,
+            "a subsidised stake claim must be addressed to the claimant's Standard-tier (k=3) address".to_string(),
+            None,
+            Some("§40.3"),
+        ),
         BurnProofInsufficientWitnesses => (
             error_code::E_BURN_PROOF_INSUFFICIENT_WITNESSES,
             ErrorCategory::ClientBug,
@@ -455,6 +678,22 @@ fn classify(
             None,
             Some("§11.9.1"),
         ),
+        ReceiverStateNotAnchored => (
+            error_code::E_RECEIVER_STATE_NOT_ANCHORED,
+            ErrorCategory::ClientBug,
+            "Redeem: the declared receiver state and the carried prev_receipts do not match \
+             (a returning receiver ships exactly its last receipt; a first-time receiver ships none)"
+                .to_string(),
+            None,
+            Some("§17.3.1.4"),
+        ),
+        ArkChargeScarred => (
+            error_code::E_ARK_CHARGE_SCARRED,
+            ErrorCategory::RecoverableDrift,
+            "Ark charge requires the sending wallet's FACT chain to be clean".to_string(),
+            Some(RecoveryHint::BurnExistingScars),
+            Some("§11.9.1b"),
+        ),
         ArkUnloadScarred => (
             error_code::E_ARK_UNLOAD_SCARRED,
             ErrorCategory::RecoverableDrift,
@@ -485,6 +724,82 @@ fn classify(
             None,
             Some("White Paper §2.10.1"),
         ),
+        // §5.2.2c — the SUBSIDISED stake lock, the general-purpose sibling of the
+        // hardcoded genesis lockup above. Classified explicitly (2026-09-05)
+        // because the fallback answered `E_CORE_UNCLASSIFIED`: the code string
+        // existed only inside the Display message, so a consumer dispatching on
+        // `error_response.code` — which CLAUDE.md §10 REQUIRES — could never see it.
+        // No recovery hint: like the genesis lockup, the only remedy is time, and
+        // `WaitAndRetry` would be a lie at this scale (a lock is ~1-3 YEARS, while
+        // that hint means "retry after `retry_after_secs`").
+        StakeLocked => (
+            error_code::E_STAKE_LOCKED,
+            ErrorCategory::ProtocolReject,
+            "Validator stake wallet is locked until its wall-clock deadline".to_string(),
+            None,
+            Some("YP §26.7.3 / ValidatorJoin §5.2.2c"),
+        ),
+        // KI#137 — NOT retryable, and deliberately worded so a holder is not told
+        // to wait: no amount of waiting turns an unmintable pair into a real lock.
+        StakeLockPairUnmintable => (
+            error_code::E_STAKE_LOCK_PAIR_UNMINTABLE,
+            ErrorCategory::ProtocolReject,
+            "Stake deadlines are a distance apart that no tier could have minted \
+             — the pair is forged, not merely unexpired".to_string(),
+            None,
+            Some("ValidatorJoin §5.2.2c (interlock)"),
+        ),
+        // §6b.13 (KI#225) — the stake floor. NOT a lock: the surplus above the
+        // floor is spendable, so the message says so. No recovery hint — the
+        // cure is a smaller send, or time (the floor lapses at the certificate's
+        // maximum life), and `WaitAndRetry` would misstate a months-long wait.
+        StakeFloor => (
+            error_code::E_STAKE_FLOOR,
+            ErrorCategory::ProtocolReject,
+            "Validator stake floor: this debit would leave the wallet below 500 AXC \
+             while its certificate can still be live — only the surplus above the \
+             floor may move".to_string(),
+            None,
+            Some("ValidatorJoin §6b.13"),
+        ),
+        // §6b.13 — a wallet state Core neither consumes nor produces.
+        WalletFormatInvalid => (
+            error_code::E_WALLET_FORMAT_INVALID,
+            ErrorCategory::ProtocolReject,
+            "Wallet format block is not the current one (wallet_version or a \
+             reserved ext field)".to_string(),
+            None,
+            Some("ValidatorJoin §6b.13"),
+        ),
+        // The claimant's declared epoch and the issuers' signed clocks disagree
+        // about the claim's own witness round. One party is lying, so this is a
+        // hard reject and NOT retryable: retrying with the same numbers reproduces
+        // it, and changing them is the attack.
+        StakeLockTimeDisagreement => (
+            error_code::E_STAKE_LOCK_TIME_DISAGREEMENT,
+            ErrorCategory::ProtocolReject,
+            "Claim time disagreement: the claimant's declared epoch and the issuers' \
+             signed timestamps do not agree about the claim's witness round"
+                .to_string(),
+            None,
+            Some("YP §26.7.3 / ValidatorJoin §5.2.2c"),
+        ),
+
+        // §23.15 TVL (KI#221) — the wallet moved faster than the tick floor.
+        // Network is healthy; the tx simply arrived too soon. WaitAndRetry once
+        // the floor elapses (~25 s). NOT poisoning — neither party is byzantine.
+        TxVelocityTooFast => (
+            error_code::E_TX_VELOCITY_TOO_FAST,
+            // OPERATIONAL, not ProtocolReject: the network is healthy and neither
+            // party is byzantine — the floor clears itself, so this is a retryable
+            // WaitAndRetry (the constructor forbids a recovery hint on a hard
+            // ProtocolReject). Same shape as `OodsUnhealthyRetry`.
+            ErrorCategory::Operational,
+            "Transaction velocity limit: this tx's attested tick is fewer than the \
+             minimum ticks after the wallet's previous transaction".to_string(),
+            Some(RecoveryHint::WaitAndRetry),
+            Some("YP §23.15 (Transaction Velocity Limit) / KI#221"),
+        ),
 
         // ── Too many unresolved scars ─────────────────────────────────────
         TooManyUnresolvedScars => (
@@ -513,7 +828,7 @@ fn classify(
         ClaraStateNotGarbage => (
             error_code::E_CLARA_STATE_NOT_GARBAGE,
             ErrorCategory::ClientBug,
-            "Validator's stored state is not in CLARA garbage list".to_string(),
+            "CLARA attestation is not for this state (eligibility = healed_to only, KI#260)".to_string(),
             None,
             Some("YPX-018 §2.3"),
         ),
@@ -532,22 +847,6 @@ fn classify(
             Some("YPX-018 §2.3"),
         ),
 
-        // ── Auth hash ─────────────────────────────────────────────────────
-        AuthHashRequired => (
-            error_code::E_AUTH_HASH_REQUIRED,
-            ErrorCategory::ClientBug,
-            "Wallet has auth_hash but transaction is missing owner_proof".to_string(),
-            None,
-            Some("YPX-007 §39.3"),
-        ),
-        InvalidAuthProof => (
-            error_code::E_INVALID_AUTH_PROOF,
-            ErrorCategory::ClientBug,
-            "Owner proof verification failed".to_string(),
-            None,
-            Some("YPX-007 §39.3"),
-        ),
-
         // ── Cheque-claim proof (CL5 synchronous double-redeem prevention) ─
         ChequeClaimProofMissing => (
             error_code::E_CHEQUE_CLAIM_PROOF_MISSING,
@@ -562,6 +861,13 @@ fn classify(
             "Cheque-claim proof signature failed verification".to_string(),
             None,
             Some("§4.6 / AXIOM_REDEEM_CLAIM"),
+        ),
+        ChequeClaimProofUnauthenticated => (
+            error_code::E_CHEQUE_CLAIM_PROOF_UNAUTHENTICATED,
+            ErrorCategory::ProtocolReject,
+            "Cheque-claim proof's claim_sig is not a valid signature by client_pk over the claim (cheque_id, client_pk, k_tier, wallet_address) — the claim was not made by the addressed receiver".to_string(),
+            None,
+            Some("YPX-022 §2.1.2a / AXIOM_CHEQUE_CLAIM"),
         ),
         ChequeClaimProofTxidMismatch => (
             error_code::E_CHEQUE_CLAIM_PROOF_TXID_MISMATCH,
@@ -594,9 +900,9 @@ fn classify(
         ChequeClaimProofExpired => (
             error_code::E_CHEQUE_CLAIM_PROOF_EXPIRED,
             ErrorCategory::ProtocolReject,
-            "Cheque-claim proof is outside the freshness window — Nabla writer's claim entry would have expired (24h TTL)".to_string(),
+            "Cheque-claim proof is older than cheque_claim_proof_max_age_ticks (CL5 freshness bound, ~24h) — re-register the claim and redeem again".to_string(),
             None,
-            Some("§4.6 / CHEQUE_CLAIM_EXPIRY_TICKS"),
+            Some("§4.6 / YPX-022 §2.1.2a / cheque_claim_proof_max_age_ticks"),
         ),
 
         // ── OODS (YPX-021) ──────────────────────────────────────────────────
@@ -619,6 +925,17 @@ fn classify(
             "OODS attestation failed verification (bad signature / NBC anchor / baseline)".to_string(),
             None,
             Some("YPX-021 §8.2"),
+        ),
+
+        // ── Class isolation: no dev VBC/NBC (the owner 2026-09-20) ─────────────
+        DevAccountForbiddenFromValidator => (
+            "E_DEV_ACCOUNT_FORBIDDEN_FROM_VALIDATOR",
+            ErrorCategory::ProtocolReject,
+            "A dev account (@axiom / @axiom.internal) cannot request or hold a \
+             validator certificate — validators and Nabla nodes must be real \
+             accounts".to_string(),
+            None,
+            Some("AXIOM_DESIGN_FactClassIsolation.md preamble point 0"),
         ),
 
         // ── Fallback ──────────────────────────────────────────────────────
@@ -676,6 +993,20 @@ mod tests {
         assert_eq!(resp.category, ErrorCategory::Operational);
         assert_eq!(resp.recovery, Some(RecoveryHint::WaitAndRetry));
         assert!(resp.is_retryable(), "recovery must be able to retry when OODS recovers");
+    }
+
+    #[test]
+    fn tx_velocity_too_fast_is_retryable_wait_and_retry() {
+        // §23.15 TVL (KI#221) — a too-fast tx is NON-poisoning: the network is
+        // healthy, the tx just arrived too soon, so it is a RETRYABLE WaitAndRetry
+        // (the client re-submits after ~25 s), NOT a hard reject of a byzantine
+        // party. This locks that classification against a future "harden it to a
+        // hard reject" mistake.
+        let resp: ErrorResponse = ValidationError::TxVelocityTooFast.into();
+        assert_eq!(resp.code.as_str(), "E_TX_VELOCITY_TOO_FAST");
+        assert_eq!(resp.category, ErrorCategory::Operational);
+        assert_eq!(resp.recovery, Some(RecoveryHint::WaitAndRetry));
+        assert!(resp.is_retryable(), "a velocity floor clears itself — the client must be told to wait and retry");
     }
 
     #[test]
@@ -743,6 +1074,31 @@ mod tests {
         assert_eq!(resp.code.as_str(), "E_GENESIS_STAKE_LOCKED");
         assert_eq!(resp.category, ErrorCategory::ProtocolReject);
         assert!(resp.recovery.is_none());
+    }
+
+    /// §5.2.2c — the two stake-lock rejections must reach the wire as THEIR OWN
+    /// codes, not as `E_CORE_UNCLASSIFIED`.
+    ///
+    /// Why this test exists (2026-09-05): both variants were falling through to
+    /// the generic arm, so their code strings survived only inside the Display
+    /// MESSAGE. CLAUDE.md §10 requires consumers to dispatch on
+    /// `error_response.code`, and a dispatcher reading `E_CORE_UNCLASSIFIED`
+    /// cannot tell a locked stake from any other unclassified reject. Deleting
+    /// either arm turns this red.
+    #[test]
+    fn stake_lock_rejections_carry_their_own_dispatch_codes() {
+        let locked: ErrorResponse = ValidationError::StakeLocked.into();
+        assert_eq!(locked.code.as_str(), "E_STAKE_LOCKED");
+        assert_eq!(locked.category, ErrorCategory::ProtocolReject);
+        // Time is the only remedy for a ~1-3 year lock; WaitAndRetry would
+        // promise the SDK a `retry_after_secs` that cannot be honoured.
+        assert!(locked.recovery.is_none(), "a stake lock has no recovery but time");
+
+        let disagreement: ErrorResponse = ValidationError::StakeLockTimeDisagreement.into();
+        assert_eq!(disagreement.code.as_str(), "E_STAKE_LOCK_TIME_DISAGREEMENT");
+        assert_eq!(disagreement.category, ErrorCategory::ProtocolReject);
+        // Not retryable: the same numbers reproduce it, and new numbers are the attack.
+        assert!(disagreement.recovery.is_none());
     }
 
     #[test]

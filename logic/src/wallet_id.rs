@@ -45,7 +45,7 @@ pub const K_MIN: u8 = 3;
 pub const K_DEFAULT: u8 = 3;
 pub const K_MAX: u8 = 5;
 
-/// proof_type encoding — matches ProofType enum in core/avm/src/dmap/mod.rs
+/// proof_type encoding — matches ProofType enum in core/logic/src/dmap/mod.rs
 pub const PROOF_TYPE_ZKP: u8 = 0;
 pub const PROOF_TYPE_DMAP: u8 = 1;
 pub const PROOF_TYPE_ARK: u8 = 2;
@@ -61,6 +61,23 @@ pub const WALLET_ID_PARAMS: [(u8, u8, &str); 7] = [
     (5, PROOF_TYPE_DMAP, "AAA"),
     (5, PROOF_TYPE_ZKP, "AAA+"),
 ];
+
+/// YP §16.14.12 v2.19.0 (KI#149) — the STATE CLASS of a tier. A key owns seven
+/// addresses (YPX-007 §2.4) but TWO ledgers: the Ark ledger (k=0, YPX-010) and
+/// ONE online ledger shared by every k≥3 / any proof type. Every derivation of
+/// a wallet's ledger identity — the genesis fold (`genesis::opening_state_id_for`),
+/// Rule B1's origin, Lambda's state-row keys, Nabla's `crypto::smt_bucket` —
+/// goes through here, never through the raw tier of the address in hand.
+/// Folding the raw tier made a wallet that RECEIVED at k=5 unable to send
+/// (its next round read the Standard id's row). ONE builder (Pattern 1).
+pub fn state_class(k: u8, proof_type: u8) -> (u8, u8) {
+    if k == K_ARK {
+        (K_ARK, PROOF_TYPE_ARK)
+    } else {
+        let _ = proof_type; // every online proof type shares the ledger
+        (K_DEFAULT, PROOF_TYPE_DMAP)
+    }
+}
 
 /// S-ABR overlap: strict majority floor(k/2) + 1.
 /// Prevents double-spend — attacker cannot present conflicting TX to fresh validators.
@@ -407,6 +424,16 @@ pub fn extract_security_level(wallet_id: &str) -> CoreResult<(u8, u8)> {
     extract_security_level_with_identity_key(&clean_id, &WALLET_IDENTITY_KEY)
 }
 
+/// YPX-010 §12 — TRUE iff both endpoints of a transfer are the Ark (k=0) tier.
+/// An Ark→Ark transfer can only be offline (§11), so its appearance on the online
+/// validator path IS a settlement (derived from tier + context — no `is_settlement`
+/// flag). Used at cheque issuance to stamp a fee-free (`rate_bps = 0`) settlement
+/// cheque: the Ark fee is the charge-in/unload boundary (§12.7), never the tap.
+pub fn both_endpoints_ark(sender_wallet_id: &str, receiver_wallet_id: &str) -> bool {
+    matches!(extract_security_level(sender_wallet_id), Ok((K_ARK, _)))
+        && matches!(extract_security_level(receiver_wallet_id), Ok((K_ARK, _)))
+}
+
 /// Extract (k, proof_type) with a specific identity key (for testing)
 pub fn extract_security_level_with_identity_key(
     wallet_id: &str,
@@ -427,15 +454,25 @@ pub fn extract_security_level_with_identity_key(
 /// FACT class isolation: true iff this wallet_id belongs to the dev
 /// class (`AXIOM_DESIGN_FactClassIsolation.md` §7).
 ///
-/// The dev class is signalled by an exact `@axiom.internal` email
-/// domain. ICANN reserves `.internal` for private/internal-network
-/// use, so it cannot clash with any public domain.
+/// **The dev class is signalled by EITHER reserved dev label —
+/// `@axiom` OR `@axiom.internal` (the owner, 2026-09-20).** Both are dev
+/// accounts, split only for log identification: `@axiom` is the soak /
+/// harness domain, `@axiom.internal` the end-user test domain. A dev
+/// account touches ONLY the dev pool (the 1M dev-AXC treasury, outside
+/// the 100M public supply), gets dev timing, and can NEVER transact
+/// with a real account (dev↔dev, real↔real — no exemptions). Neither
+/// label is a routable public domain — `axiom` is a bare label with no
+/// dot, and ICANN reserves `.internal` for private use — so neither can
+/// clash with a real domain. Validators / Nabla nodes are REAL accounts
+/// (a real domain such as `validator.example.org`); a dev account is
+/// hard-rejected from VBC/NBC issuance.
 ///
 /// Match is strict and case-insensitive on the domain only:
-/// - `developer@axiom.internal` → true
-/// - `alice@axiom.com` → false
-/// - `bob@axiom.internal.foo` → false
-/// - `charlie@axiom` → false
+/// - `developer@axiom.internal` → true  (dev — end-user test)
+/// - `charlie@axiom` → true             (dev — soak / harness)
+/// - `alice@axiom.com` → false          (real — public domain)
+/// - `bob@axiom.internal.foo` → false   (real — not the reserved label)
+/// - `node@validator.example.org` → false (real — a validator domain)
 pub fn is_dev_wallet(wallet_id: &str) -> bool {
     let after_pgp = strip_encryption_suffix(wallet_id);
     let (clean, _) = strip_email_change_suffix(&after_pgp);
@@ -443,7 +480,7 @@ pub fn is_dev_wallet(wallet_id: &str) -> bool {
     let mut parts = email.splitn(2, '@');
     let _local = parts.next();
     let domain = parts.next().unwrap_or("").to_ascii_lowercase();
-    domain == "axiom.internal"
+    domain == "axiom" || domain == "axiom.internal"
 }
 
 /// FACT class isolation rule R1
@@ -483,6 +520,22 @@ pub fn check_domain_isolation(
 /// produces the correct pk_bind.
 ///
 /// Call extract_security_level first to get (k, pt), then verify_pk_binding with pk.
+/// ⚠ **FORMAT / TYPO CHECK — NOT AN AUTHORIZATION PRIMITIVE (KI#51).**
+///
+/// `pk_bind` is **one byte** ([`compute_pk_bind`] → `hash[0..1]`) and this
+/// function accepts a match against **any of the 7** [`WALLET_ID_PARAMS`]
+/// combinations, so an unrelated `(wallet_id, pk)` pair verifies with
+/// probability ≈ 7/256 ≈ **2.7%** — deterministic per pair, so a colliding
+/// pair fails forever. That is fine for its designed job (catching a
+/// mistyped address, which is why the id is short and human-typeable) and
+/// **unfit for deciding ownership between two parties**.
+///
+/// It WAS used that way, in `validation.rs` Step -0.4, to answer "is the
+/// receiver the sender's own address?" for the §11.9 tier rules. A false
+/// positive there both blocked legitimate sends (observed live: soak
+/// `s2r9975`, `003 → 000`, rejected `SelfSendRejected` 6/6) and admitted
+/// unauthorized Ark charge/unload. Use [`is_own_address`] for ownership;
+/// it is exact.
 pub fn verify_pk_binding(wallet_id: &str, pk: &[u8; 32]) -> CoreResult<()> {
     let after_pgp = strip_encryption_suffix(wallet_id);
     let (clean_id, _) = strip_email_change_suffix(&after_pgp);
@@ -508,12 +561,66 @@ pub fn verify_pk_binding_with_identity_key(
     Err(ValidationError::InvalidWalletId)
 }
 
+/// Is `receiver_wallet_id` an address of the SAME identity as
+/// `sender_wallet_id`, under the key `sender_pk`?  **Exact** — no
+/// probability (KI#51).
+///
+/// Under the single-keypair model (`AXIOM_DESIGN_WalletPairCollapse.md`,
+/// adopted 2026-07-17) one identity is one keypair whose tier addresses are
+/// fully determined by `(email, salt, pk)`. So ownership is decided by
+/// REGENERATING the sender's own tier addresses and comparing exactly —
+/// never by asking an 8-bit hash prefix.
+///
+/// Every candidate carries the SENDER's email by construction, so a foreign
+/// address (different email) can never match, whatever the `pk_bind` bits
+/// do. Verified over 120 identities × 7 tiers × 5 suffix spellings
+/// (3,528,000 pairs) with zero false positives and zero false negatives:
+/// `core/logic/examples/ki51_ownness_exhaustive.rs`.
+///
+/// Both sides are canonicalised first — `-P`/`-G` (encryption) and
+/// `-01..-99` (email change) mean one wallet has several spellings. Skipping
+/// that made a self-send spelled `id → id-P` invisible, silently bypassing
+/// the very rule that rejects circular transactions.
+pub fn is_own_address(sender_wallet_id: &str, receiver_wallet_id: &str, sender_pk: &[u8; 32]) -> bool {
+    let canon = |id: &str| -> String {
+        let after = strip_encryption_suffix(id);
+        strip_email_change_suffix(&after).0
+    };
+    let (s_canon, r_canon) = (canon(sender_wallet_id), canon(receiver_wallet_id));
+
+    // Same wallet — the only exact answer a self-send needs.
+    if s_canon == r_canon {
+        return true;
+    }
+    // Otherwise: is the receiver one of the sender's OTHER tier addresses?
+    // (Direction-agnostic — covers Ark charge (→ own k=0) and Ark unload
+    // (k=0 → own normal) without per-rule special-casing.)
+    let Ok((email, _checksum, _pk_bind, salt)) = parse_wallet_id(&s_canon) else {
+        return false;
+    };
+    let Ok(tiers) = generate_all_wallet_ids(&email, &salt, sender_pk) else {
+        return false;
+    };
+    tiers.iter().any(|(id, _k, _pt, _name)| canon(id) == r_canon)
+}
+
 /// Generate a wallet_id for an email with a given salt and pk (defaults to Standard: k=3, dmap)
 ///
 /// Returns full wallet_id: "email/hex10" where hex10 = checksum(6) + pk_bind(2) + salt(2)
 /// pk is bound via pk_bind for CL5 identity verification (prevents cheque theft).
 ///
 /// SECURITY: Email is normalized before checksum computation.
+/// The SALT every wallet address carries: the first two hex chars of
+/// BLAKE3(pk). ONE derivation (Pattern 1) — the SDK's `create`, its address
+/// re-derivations, and the G1 ceremony's genesis stake wallet ids all call
+/// this, so a genesis id written at the ceremony is byte-equal to the address
+/// the SDK later derives from the same key. (The ceremony used a fixed `"00"`
+/// until 2026-09-08, which produced a second address for one key.)
+pub fn default_salt(pk: &[u8]) -> alloc::string::String {
+    let h = blake3::hash(pk);
+    String::from(&hex::encode(h.as_bytes())[..2])
+}
+
 pub fn generate_wallet_id(email: &str, salt: &str, pk: &[u8; 32]) -> CoreResult<String> {
     generate_wallet_id_with_identity_key(email, salt, &WALLET_IDENTITY_KEY, pk)
 }
@@ -574,6 +681,87 @@ pub fn generate_all_wallet_ids_with_identity_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── KI#51: own-ness must be EXACT ─────────────────────────────────
+    // These fail against the old `verify_pk_binding` predicate.
+
+    /// The live failure shape: two different identities whose 8-bit
+    /// `pk_bind` collides. `verify_pk_binding` calls that "own" (so Rule 4
+    /// rejected the send as a self-send, 6/6 in soak s2r9975);
+    /// `is_own_address` does not.
+    #[test]
+    fn ki51_colliding_foreign_pair_is_not_own() {
+        let victim_pk: [u8; 32] = *blake3::hash(b"ki51-victim").as_bytes();
+        let victim_salt = hex::encode(blake3::hash(&victim_pk).as_bytes())[..2].to_string();
+        let victim_id = generate_wallet_id_full(
+            "victim@axiom", &victim_salt, &WALLET_IDENTITY_KEY, &victim_pk, 3, PROOF_TYPE_DMAP,
+        ).unwrap();
+
+        let mut found = None;
+        for i in 0..8000u32 {
+            let pk: [u8; 32] = *blake3::hash(&i.to_le_bytes()).as_bytes();
+            if verify_pk_binding(&victim_id, &pk).is_ok() {
+                found = Some((i, pk));
+                break;
+            }
+        }
+        let (i, attacker_pk) = found.expect("an 8-bit collision must exist within 8000 keys");
+        let att_salt = hex::encode(blake3::hash(&attacker_pk).as_bytes())[..2].to_string();
+        let attacker_id = generate_wallet_id_full(
+            &format!("attacker{i}@axiom"), &att_salt, &WALLET_IDENTITY_KEY,
+            &attacker_pk, 3, PROOF_TYPE_DMAP,
+        ).unwrap();
+
+        assert!(verify_pk_binding(&victim_id, &attacker_pk).is_ok(),
+            "fixture must be a real collision");
+        assert!(!is_own_address(&attacker_id, &victim_id, &attacker_pk),
+            "KI#51: a foreign address must never be judged own");
+    }
+
+    /// Every one of an identity's own tier addresses IS own — including
+    /// across the Ark boundary in both directions (charge and unload).
+    #[test]
+    fn ki51_own_tier_addresses_are_own_both_directions() {
+        let pk: [u8; 32] = *blake3::hash(b"ki51-owner").as_bytes();
+        let salt = hex::encode(blake3::hash(&pk).as_bytes())[..2].to_string();
+        let tiers = generate_all_wallet_ids("owner@axiom", &salt, &pk).unwrap();
+        for (from, _, _, fname) in tiers.iter() {
+            for (to, _, _, tname) in tiers.iter() {
+                assert!(is_own_address(from, to, &pk),
+                    "own tier {fname} -> {tname} must be own");
+            }
+        }
+    }
+
+    /// Suffix spellings must not change the verdict — a self-send written
+    /// `id -> id-P` is still a self-send, else Rule 4 is silently bypassed.
+    #[test]
+    fn ki51_suffix_spellings_preserve_ownness() {
+        let pk: [u8; 32] = *blake3::hash(b"ki51-suffix").as_bytes();
+        let salt = hex::encode(blake3::hash(&pk).as_bytes())[..2].to_string();
+        let id = generate_wallet_id_full(
+            "sfx@axiom", &salt, &WALLET_IDENTITY_KEY, &pk, 3, PROOF_TYPE_DMAP).unwrap();
+        let ark = generate_wallet_id_full(
+            "sfx@axiom", &salt, &WALLET_IDENTITY_KEY, &pk, K_ARK, PROOF_TYPE_ARK).unwrap();
+        for suf in ["", "-P", "-G", "-01", "-99"] {
+            assert!(is_own_address(&id, &format!("{id}{suf}"), &pk),
+                "self-send with suffix {suf:?} must stay own");
+            assert!(is_own_address(&format!("{id}{suf}"), &id, &pk),
+                "sender suffix {suf:?} must stay own");
+            assert!(is_own_address(&id, &format!("{ark}{suf}"), &pk),
+                "own Ark with suffix {suf:?} must stay own");
+        }
+    }
+
+    /// Fails closed on garbage rather than defaulting to "own".
+    #[test]
+    fn ki51_malformed_ids_are_not_own() {
+        let pk: [u8; 32] = *blake3::hash(b"ki51-malformed").as_bytes();
+        for bad in ["", "no-slash", "a@b/", "/xyz", "a@b/zzzzzzzzzz"] {
+            assert!(!is_own_address(bad, "other@axiom/0123456789", &pk));
+            assert!(!is_own_address("other@axiom/0123456789", bad, &pk));
+        }
+    }
     
     #[test]
     fn test_parse_wallet_id() {
@@ -966,19 +1154,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_dev_wallet_recognises_axiom_internal_only() {
-        // EXACT @axiom.internal domain → dev.
+    fn test_is_dev_wallet_recognises_axiom_and_axiom_internal() {
+        // Both reserved dev labels → dev (the owner 2026-09-20: @axiom soak +
+        // @axiom.internal end-user are BOTH dev; dev↔dev only, dev pool only).
         assert!(is_dev_wallet(&classed_wid("developer@axiom.internal")));
         assert!(is_dev_wallet(&classed_wid("tester@axiom.internal")));
+        assert!(is_dev_wallet(&classed_wid("s2r0001@axiom")));          // soak/harness → dev
+        assert!(is_dev_wallet(&classed_wid("alice@axiom")));            // bare axiom → dev
         // Case-insensitive on the domain.
         assert!(is_dev_wallet(&classed_wid("DEV@AXIOM.INTERNAL")));
-        // Everything else → not dev.
+        assert!(is_dev_wallet(&classed_wid("SOAK@AXIOM")));
+        // Everything else → REAL (not dev).
         assert!(!is_dev_wallet(&classed_wid("alice@example.com")));
-        assert!(!is_dev_wallet(&classed_wid("alice@axiom")));           // missing .internal
-        assert!(!is_dev_wallet(&classed_wid("alice@axiom.com")));       // .com not .internal
+        assert!(!is_dev_wallet(&classed_wid("alice@axiom.com")));       // .com not the label
         assert!(!is_dev_wallet(&classed_wid("alice@axiom.internal.com"))); // subdomain
         assert!(!is_dev_wallet(&classed_wid("alice@axiom-internal")));  // hyphen not dot
         assert!(!is_dev_wallet(&classed_wid("alice@myaxiom.internal"))); // prefix
+        assert!(!is_dev_wallet(&classed_wid("node@validator.example.org"))); // validator domain → real
     }
 
     #[test]
@@ -1009,6 +1201,22 @@ mod tests {
             &classed_wid("alice@example.com"),
         ).expect_err("dev -> public must be rejected (symmetric R1)");
         assert_eq!(err2, ValidationError::DomainMismatch);
+        // @axiom is ALSO dev (the owner 2026-09-20) — @axiom ↔ real must reject.
+        let err3 = check_domain_isolation(
+            &classed_wid("s2r0001@axiom"),
+            &classed_wid("alice@example.com"),
+        ).expect_err("@axiom (dev) -> public must be rejected");
+        assert_eq!(err3, ValidationError::DomainMismatch);
+        let err4 = check_domain_isolation(
+            &classed_wid("alice@example.com"),
+            &classed_wid("s2r0001@axiom"),
+        ).expect_err("public -> @axiom (dev) must be rejected");
+        assert_eq!(err4, ValidationError::DomainMismatch);
+        // …but the two dev labels CAN transact with each other (both dev).
+        check_domain_isolation(
+            &classed_wid("s2r0001@axiom"),
+            &classed_wid("tester@axiom.internal"),
+        ).expect("@axiom <-> @axiom.internal must pass R1 (both dev)");
     }
 
     #[test]

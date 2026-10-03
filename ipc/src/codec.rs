@@ -226,9 +226,8 @@ const PI_CL1_EXEC_PROOF: i64 = 20;    // CL1: client execution proof
 const PI_ZKP_NONCE: i64 = 21;         // ZKP anti-replay nonce
 // §23.14 fields (not previously in CBOR — were serde-only)
 const PI_AUDIT_CONFIRM: i64 = 22;    // §23.14 audit confirmation
-const PI_SCAR_HEAL_TX: i64 = 23;     // CL9 scar heal tx_id
-const PI_SCAR_HEAL_NABLA: i64 = 24;  // CL9 scar heal nabla_id
-const PI_SCAR_HEAL_ROOT: i64 = 25;   // CL9 scar heal root_hash
+// Keys 23–25 RETIRED 2026-09-15 (CL9 scar-heal fields, removed with the
+// YPX-001 §1.5.3 push path). Reserved; do not reuse.
 // YPX-009 Silicon Pulse fields
 const PI_NONCE_RESPONSE: i64 = 26;   // YPX-009: nonce response from Lambda
 const PI_AUDIT_RESPONSE: i64 = 27;   // YPX-009: audit response from Lambda
@@ -238,6 +237,9 @@ const PI_CONSOLE_NEW: i64 = 29;      // CL11: new ConsoleCertificate
 const PI_CONSOLE_PICKS: i64 = 30;    // CL11: selector picks
 const PI_CONSOLE_NOMS: i64 = 31;     // CL11: nominations
 const PI_MAX_FACT_LINKS: i64 = 32;   // Operator's max_fact_links (None = unlimited)
+const PI_FACT_CERTS: i64 = 33;       // YP §26.17.6.5 B2: certificate bundles the FACT witnesses resolve to
+const PI_RCV_STAKE_FLOOR: i64 = 34;  // ValidatorJoin §6b.13: receiver's current stake_floor_until (CL5 carries it)
+const PI_RCV_WALLET_FORMAT: i64 = 35; // §6b.13: receiver's current wallet-format block (CL5 refuses a non-current one)
 
 // PublicOutputs
 const PO_RESULT: i64 = 0;
@@ -261,6 +263,9 @@ const PO_AUDIT_REQUEST: i64 = 15;     // YPX-009: audit request from AVM
 const PO_NONCE_CHALLENGE: i64 = 16;   // YPX-009: nonce challenge from AVM
 const PO_PULSE_PROOF: i64 = 17;       // YPX-009: pulse proof data
 const PO_AUDIT_FAILED: i64 = 18;      // YPX-009: audit failure flag
+const PO_EMISSION_EPOCH: i64 = 19;    // §4.2a: produced emission_claimed_epoch
+const PO_STAKE_FLOOR: i64 = 20;       // ValidatorJoin §6b.13: produced stake_floor_until
+const PO_WALLET_FORMAT: i64 = 21;     // §6b.13: produced wallet-format block
 
 // ============================================================================
 // ENCODE/DECODE: PublicInputs
@@ -284,6 +289,11 @@ fn inputs_to_value(pi: &PublicInputs) -> Value {
         (PI_GROUP_IDX, cbor_opt(&pi.group_member_index, |v| cbor_u64(*v as u64))),
         (PI_SENDER_FACT, cbor_opt(&pi.sender_fact_chain, fact_chain_to_value)),
         (PI_MAX_FACT_LINKS, cbor_opt(&pi.max_fact_links, |v| cbor_u64(*v as u64))),
+        (PI_FACT_CERTS, cbor_array(pi.fact_certificates.iter().map(blob_encode).collect())),
+        // §6b.13 — threaded (not the lock's "not carried" treatment): CL5 REFUSES
+        // a missing format block, so dropping it here would fail every IPC redeem.
+        (PI_RCV_STAKE_FLOOR, cbor_opt(&pi.receiver_current_stake_floor_until, |v| cbor_u64(*v))),
+        (PI_RCV_WALLET_FORMAT, cbor_opt(&pi.receiver_current_wallet_format, blob_encode)),
         (PI_DIL_SK, cbor_opt(&pi.my_dilithium_sk, |v| cbor_bytes(v))),
         (PI_DIL_PK, cbor_opt(&pi.my_dilithium_pk, |v| cbor_bytes(v))),
         (PI_MY_VAL_ID, cbor_opt(&pi.my_validator_id, |v| cbor_bytes(v))),
@@ -292,9 +302,6 @@ fn inputs_to_value(pi: &PublicInputs) -> Value {
         (PI_CL1_EXEC_PROOF, cbor_opt(&pi.cl1_execution_proof, |v| cbor_bytes(v))),
         (PI_ZKP_NONCE, cbor_opt(&pi.zkp_nonce, |v| cbor_bytes(v))),
         (PI_AUDIT_CONFIRM, cbor_opt(&pi.audit_confirmation, blob_encode)),
-        (PI_SCAR_HEAL_TX, cbor_opt(&pi.scar_heal_tx_id, |v| cbor_bytes(v))),
-        (PI_SCAR_HEAL_NABLA, cbor_opt(&pi.scar_heal_nabla_id, |v| cbor_bytes(v))),
-        (PI_SCAR_HEAL_ROOT, cbor_opt(&pi.scar_heal_root_hash, |v| cbor_bytes(v))),
         (PI_NONCE_RESPONSE, cbor_opt(&pi.nonce_response, blob_encode)),
         (PI_AUDIT_RESPONSE, cbor_opt(&pi.audit_response, blob_encode)),
         // CL11 Console fields
@@ -313,7 +320,12 @@ fn value_to_inputs(val: &Value) -> Result<PublicInputs, String> {
         // oods_attestation not encoded via IPC (only used in the direct
         // AVM path — same treatment as txid_attestation).
         oods_attestation: None,
+        // zkq_request (YPX-007 §9.2): same treatment — direct-AVM-path only.
+        zkq_request: None,
         recall_attestation: None,
+        // fob_claim_attestation: same treatment — direct-AVM-path only.
+        fob_claim_attestation: None,
+        claimant_vbc: None,
         mode: u64_to_mode(val_u64(require_field(m, PI_MODE, "mode")?)?)?,
         transaction: value_to_tx(require_field(m, PI_TX, "tx")?)?,
         prev_receipts: val_array(require_field(m, PI_PREV_RECEIPTS, "prev_receipts")?)?
@@ -331,7 +343,13 @@ fn value_to_inputs(val: &Value) -> Result<PublicInputs, String> {
             .iter().map(value_to_wsig).collect::<Result<Vec<_>,_>>()?,
         group_member_index: val_opt(require_field(m, PI_GROUP_IDX, "gidx")?, |v| val_u64(v).map(|n| n as u32))?,
         sender_fact_chain: val_opt(require_field(m, PI_SENDER_FACT, "sfc")?, value_to_fact_chain)?,
+        receiver_witness: None,
+        receiver_signing_key: None,
         max_fact_links: val_opt(require_field(m, PI_MAX_FACT_LINKS, "mfl")?, |v| val_u64(v).map(|n| n as u32))?,
+        fact_certificates: match get_map_field(m, PI_FACT_CERTS) {
+            Some(v) => val_array(v)?.iter().map(blob_decode::<VBCProofBundle>).collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(), // pre-amendment vectors carry none (their FACT witnesses then fail to bind — by design)
+        },
         // IPC codec is conformance / multi-host only (CLAUDE.md). The
         // embedded-AVM path round-trips this field via serde directly;
         // IPC mode hasn't been wired for redeem yet, so leave None.
@@ -365,22 +383,9 @@ fn value_to_inputs(val: &Value) -> Result<PublicInputs, String> {
             Some(v) => val_opt(v, blob_decode::<PulseAuditResponse>)?,
             None => None,
         },
-        scar_heal_tx_id: match get_map_field(m, PI_SCAR_HEAL_TX) {
-            Some(v) => val_opt(v, val_bytes32)?,
-            None => None,
-        },
-        scar_heal_nabla_id: match get_map_field(m, PI_SCAR_HEAL_NABLA) {
-            Some(v) => val_opt(v, val_bytes32)?,
-            None => None,
-        },
-        scar_heal_root_hash: match get_map_field(m, PI_SCAR_HEAL_ROOT) {
-            Some(v) => val_opt(v, val_bytes32)?,
-            None => None,
-        },
         // Fields not carried over IPC CBOR — set defaults
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         // CL11 Console fields
@@ -412,11 +417,16 @@ fn value_to_inputs(val: &Value) -> Result<PublicInputs, String> {
         // see validation.rs Step -1.5.
         local_core_id: [0u8; 32],
 
-        withdrawal_inputs: None,
         // YPX-020 hibernation: not carried over IPC (conformance / multi-host
         // only). Redeem-side state-anchoring runs through the embedded-AVM
         // path which round-trips this via serde directly.
         receiver_current_hibernation: None,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None, // §4.2a — same IPC treatment as the two above
+        receiver_current_stake_floor_until: val_opt(
+            require_field(m, PI_RCV_STAKE_FLOOR, "rfloor")?, val_u64)?,
+        receiver_current_wallet_format: val_opt(
+            require_field(m, PI_RCV_WALLET_FORMAT, "rfmt")?, blob_decode::<WalletFormat>)?,
     })
 }
 
@@ -445,6 +455,9 @@ fn outputs_to_value(po: &PublicOutputs) -> Value {
         (PO_NONCE_CHALLENGE, cbor_opt(&po.nonce_challenge, blob_encode)),
         (PO_PULSE_PROOF, cbor_opt(&po.pulse_proof, blob_encode)),
         (PO_AUDIT_FAILED, cbor_bool(po.audit_failed)),
+        (PO_EMISSION_EPOCH, cbor_u64(po.emission_claimed_epoch)),
+        (PO_STAKE_FLOOR, cbor_u64(po.stake_floor_until)),
+        (PO_WALLET_FORMAT, blob_encode(&po.wallet_format)),
     ];
     cbor_map(pairs)
 }
@@ -452,8 +465,22 @@ fn outputs_to_value(po: &PublicOutputs) -> Value {
 fn value_to_outputs(val: &Value) -> Result<PublicOutputs, String> {
     let m = val_map(val)?;
     Ok(PublicOutputs {
+        wall_clock_lock: 0,
+        // §4.2a — thread both ways like the witnessed hash it is bound into.
+        emission_claimed_epoch: get_map_field(m, PO_EMISSION_EPOCH).map(val_u64).transpose()?.unwrap_or(0),
+        // §6b.13 — REQUIRED both ways (no default: a missing floor is the
+        // silent zero RULE 13 forbids).
+        stake_floor_until: val_u64(require_field(m, PO_STAKE_FLOOR, "floor")?)?,
+        // YPX-007 §9.4 record: direct-AVM-path only, like oods_flag below.
+        zkp_qualification: None,
+        wallet_format: blob_decode::<WalletFormat>(require_field(m, PO_WALLET_FORMAT, "wfmt")?)?,
         // Same conformance-only treatment as is_dev_class (YPX-021 §8.2).
         oods_flag: None,
+        confidence_index: None,
+        // §32.3 — conformance/multi-host IPC path does not round-trip the
+        // Core-computed sender lineage (same treatment as oods_flag above);
+        // production carries it via the direct in-memory AVM path.
+        sender_state: None,
         result: u64_to_vr(val_u64(require_field(m, PO_RESULT, "result")?)?)?,
         new_state_hash: val_opt(require_field(m, PO_STATE_HASH, "sh")?, val_bytes32)?,
         produced_state_id: val_opt(require_field(m, PO_PROD_SID, "psid")?, val_bytes32)?,
@@ -504,12 +531,12 @@ fn value_to_outputs(val: &Value) -> Result<PublicOutputs, String> {
         fanout_new_ttl: None,
         console_chain_hash: None,
         compressed_fact_chain: None,
+        ark_send_fact_chain: None,
         // A2-redeem chain — embedded-AVM path round-trips this via serde;
         // IPC codec leaves it None until IPC mode is wired for redeem.
         receiver_fact_chain: None,
         receipt_commitment: None,
 
-        validator_withdrawal_mint: None,
         // Not carried over IPC CBOR — IPC path is conformance-only and
         // never sees the dev-class flag. Defaults to None (Lambda
         // treats None as `false` at the Receipt-build site).
@@ -533,15 +560,21 @@ fn mode_to_u64(m: &CoreLogicMode) -> u64 {
         CoreLogicMode::CL5 => 5,
         // Code 6 retired (CL6 standalone VBC-verify removed as dead code 2026-07-05).
         CoreLogicMode::CL7 => 7, CoreLogicMode::CL8 => 8,
-        CoreLogicMode::CL9 => 9, CoreLogicMode::CL10 => 10,
+        // Code 9 retired 2026-09-15 (CL9 scar-heal signing removed with the
+        // YPX-001 §1.5.3 push path). Slot stays reserved; do not reuse.
+        CoreLogicMode::CL10 => 10,
         CoreLogicMode::CL11 => 11,
         CoreLogicMode::CL2_PREFILTER => 12,
         // Code 13 retired (old CL12 / JFP_VERDICT removed — out-of-scope
         // Phase 3c rewrite). Slot stays reserved; do not reuse.
-        CoreLogicMode::CL13 => 14,
+        // Code 14 retired 2026-08-10 (CL13 withdrawal-mint mode removed with
+        // KI#83 — the fee claim is now TxKind::ValidatorWithdrawalMint through
+        // the ordinary CL2/CL3 path). Slot stays reserved; do not reuse.
         // CL12 reused for offline Send Proof verification (fresh code 15 — the
         // retired 13 is NOT reused).
         CoreLogicMode::CL12 => 15,
+        CoreLogicMode::ArkSendFinalize => 16,
+        CoreLogicMode::ZkpQualify => 17, // YPX-007 §9.4 (KI#125)
     }
 }
 
@@ -552,12 +585,15 @@ fn u64_to_mode(n: u64) -> Result<CoreLogicMode, String> {
         5 => Ok(CoreLogicMode::CL5),
         // Code 6 retired (CL6 removed 2026-07-05) — decodes to an error now.
         7 => Ok(CoreLogicMode::CL7), 8 => Ok(CoreLogicMode::CL8),
-        9 => Ok(CoreLogicMode::CL9), 10 => Ok(CoreLogicMode::CL10),
+        // Code 9 retired 2026-09-15 (CL9 removed) — decodes to an error now.
+        10 => Ok(CoreLogicMode::CL10),
         11 => Ok(CoreLogicMode::CL11),
         12 => Ok(CoreLogicMode::CL2_PREFILTER),
         // Code 13 retired (old CL12 / JFP_VERDICT removed).
-        14 => Ok(CoreLogicMode::CL13),
+        // Code 14 retired 2026-08-10 (CL13 removed with KI#83).
         15 => Ok(CoreLogicMode::CL12),
+        16 => Ok(CoreLogicMode::ArkSendFinalize),
+        17 => Ok(CoreLogicMode::ZkpQualify),
         _ => Err(format!("unknown mode: {}", n)),
     }
 }
@@ -574,7 +610,12 @@ fn u64_to_vr(n: u64) -> Result<ValidationResult, String> {
 }
 
 /// ValidationError → integer code. Stable — NEVER renumber.
-fn ve_to_u64(e: &ValidationError) -> u64 {
+/// Numeric wire discriminant for a `ValidationError`.
+///
+/// Public so the conformance vector generator can emit the SAME number the
+/// wire carries, instead of maintaining a parallel name↔code table that would
+/// drift. This is the single source of truth for the mapping.
+pub fn ve_to_u64(e: &ValidationError) -> u64 {
     match e {
         // State
         ValidationError::StateIdAlreadyConsumed => 100,
@@ -598,6 +639,27 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         ValidationError::InvalidVBC => 500,
         ValidationError::VBCExpired { .. } => 501,
         ValidationError::VBCNotYetValid { .. } => 502,
+        // 508: a PROVISIONAL cert presented as a signer's credential
+        // (ValidatorJoin §5.2.2). Filed with the VBC family here even though
+        // the variant sits at the end of the enum — see its doc comment.
+        ValidationError::VBCProvisionalCannotServe { .. } => 508,
+        // 510-515: §5.3 genesis-lineage admission, shared by
+        // `vbc::verify_chain_recursive` and CL8's fail-fast twin.
+        ValidationError::VBCNoAttestedTick => 510,
+        ValidationError::VBCIssuerCertMissing => 511,
+        ValidationError::VBCIssuerCannotIssue => 512,
+        ValidationError::VBCIssuerNoLineage => 513,
+        ValidationError::VBCIssuersShareLineage => 514,
+        ValidationError::VBCLineageNotAdopted => 515,
+        // 520-526: CL8 certificate issuance.
+        ValidationError::Cl8MissingBundle => 520,
+        ValidationError::Cl8MissingIssuerKey => 521,
+        ValidationError::Cl8SignerNotInIssuerSet => 522,
+        ValidationError::Cl8ProvisionalLifetimeInvalid => 523,
+        ValidationError::Cl8IssuerKeyUnusable => 524,
+        ValidationError::Cl8SigningFailed => 525,
+        ValidationError::Cl8VerifyAfterSignFailed => 526,
+        ValidationError::Cl8OodsStampMismatch => 527,
         ValidationError::VBCChainTooDeep => 503,
         ValidationError::VBCMissingIssuer => 504,
         ValidationError::VBCRootKeyMismatch => 505,
@@ -631,9 +693,8 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         ValidationError::SABROverlapNotInPrev => 921,
         ValidationError::SABRMissingValidatorPK => 922,
         ValidationError::SABRHashMismatch => 923,
-        // Auth
-        ValidationError::AuthHashRequired => 950,
-        ValidationError::InvalidAuthProof => 951,
+        // 950 / 951 (AuthHashRequired / InvalidAuthProof) RETIRED 2026-09-25 with
+        // `owner_proof` (KI#108) — never reassign.
         // Lineage
         ValidationError::ReceiptFromWrongWorldline => 960,
         ValidationError::ReceiptLineageMismatch => 961,
@@ -652,6 +713,12 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         ValidationError::FactInvalidSignature => 1003,
         ValidationError::FactDuplicateWitness => 1004,
         ValidationError::FactInvalidCheckpoint => 1005,
+        // YP §26.17.6.5 FACT Provenance Binding (2026-09-11)
+        ValidationError::FactWitnessUncertified => 1006,
+        ValidationError::FactOriginInvalid => 1007,
+        ValidationError::FactCertificateInvalid => 1008,
+        ValidationError::FactBurnSigInvalid => 1009,
+        ValidationError::StakeClaimTierInvalid => 1011,
         // Burn
         ValidationError::BurnNoFactChain => 1020,
         ValidationError::BurnMissingTarget => 1021,
@@ -670,7 +737,7 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         ValidationError::MissingExecutionProof => 853,
         ValidationError::MissingVBC => 854,
         // YPX-007
-        ValidationError::ZkpNotQualified => 930,
+        // 930 RETIRED 2026-10-03 (ZkpNotQualified deleted, KI#125) — decodes to an error.
         ValidationError::ArkNotImplemented => 931,
         // YPX-012 Oracle
         ValidationError::OracleSenderMismatch => 1100,
@@ -682,8 +749,7 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         ValidationError::OracleMaturityNotReached => 1106,
         // Version
         ValidationError::VersionMismatch => 1040,
-        // CL9
-        ValidationError::MissingDilithiumKey => 1050,
+        // Code 1050 retired 2026-09-15 (MissingDilithiumKey, removed with CL9). Reserved.
         ValidationError::MissingField => 1051,
         // Wallet secret
         ValidationError::WalletSecretMismatch => 1060,
@@ -708,17 +774,18 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         ValidationError::ArkToNonArkRejected => 1302,
         ValidationError::ArkChargeNotOwner => 1303,
         ValidationError::ArkUnloadScarred => 1304,
-        // Nabla stake
-        ValidationError::NablaWriterDetected => 1310,
-        ValidationError::StakeWalletMismatch => 1311,
-        ValidationError::StakeNablaSignatureInvalid => 1312,
-        ValidationError::StakeStateMismatch => 1313,
-        ValidationError::StakeInsufficientReceipts => 1314,
-        ValidationError::StakeProofExpired => 1315,
+        // Codes 1310-1316 retired 2026-10-02 (KI#249: NablaWriterDetected and the
+        // six Stake* CL8 stake-proof refusals, deleted — no emitter since
+        // §6b.8a / KI#168). Reserved — never reassign.
+        ValidationError::VbcNotRegistered => 1317,
+        ValidationError::VbcStampInvalid => 1318,
+        ValidationError::VbcCandidacyPulseMissing => 1319,
+        ValidationError::VbcCandidacyPulseInvalid => 1320,
+        ValidationError::VbcCandidacyPulseUntimed => 1321, // KI#158
         // v2.11.13 additions
         ValidationError::ReferenceTooLarge => 1400,
         ValidationError::GroupMemberMismatch => 1401,
-        ValidationError::MissingDilithiumPk => 1402,
+        // Code 1402 retired 2026-09-15 (MissingDilithiumPk, removed with CL9). Reserved.
         ValidationError::SelfSendRejected => 1403,
         ValidationError::ReceiverAddressRequired => 1404,
         ValidationError::InvalidReceiverAddress => 1405,
@@ -738,8 +805,104 @@ fn ve_to_u64(e: &ValidationError) -> u64 {
         // Other
         ValidationError::InvalidMode => 9998,
         ValidationError::InternalError => 9999,
-        // Catch-all for any remaining/future variants
-        _ => 9900,
+        // 1700-1781 — every variant that had NO mapping until 2026-10-02 and
+        // crossed the boundary as the 9900 catch-all, which `u64_to_ve` cannot
+        // decode (so `decode_outputs` FAILED on e.g. `ChequeClaimProofMissing`,
+        // `StateNotAnchored`, `TxVelocityTooFast`), and any two unmapped reasons
+        // were indistinguishable (KI#49). Appended in enum-declaration order.
+        ValidationError::StateNotAnchored => 1700,
+        ValidationError::VBCUnusableSoon { .. } => 1701,
+        ValidationError::VBCStaleAttestation { .. } => 1702,
+        ValidationError::VBCLifetimeTooLong { .. } => 1703,
+        ValidationError::VbcRenewalNoProofOfWork => 1704,
+        ValidationError::VbcRenewalNotCoSigned => 1705,
+        ValidationError::VbcRenewalWorkReceiptStale => 1706,
+        ValidationError::VbcRenewalWorkReceiptSubQuorum => 1707,
+        ValidationError::GenesisNameReserved => 1708,
+        ValidationError::RedeemSenderAnchorMissing => 1709,
+        ValidationError::RedeemBeforeCommitPropagated => 1710,
+        ValidationError::TxidAttestationMissing => 1711,
+        ValidationError::TxidAttestationInvalidSig => 1712,
+        ValidationError::TxidAttestationRedeemed => 1713,
+        ValidationError::TxidAttestationBadStatus => 1714,
+        ValidationError::TxidAttestationUntrusted => 1715,
+        ValidationError::ChequeClaimProofMissing => 1716,
+        ValidationError::ChequeClaimProofInvalidSig => 1717,
+        ValidationError::ChequeClaimProofUnauthenticated => 1718,
+        ValidationError::ChequeClaimProofTxidMismatch => 1719,
+        ValidationError::ChequeClaimProofReceiverMismatch => 1720,
+        ValidationError::ChequeClaimProofUntrusted => 1721,
+        ValidationError::TxidAlreadyInReceiverChain => 1722,
+        ValidationError::ChequeClaimProofExpired => 1723,
+        ValidationError::FeeExceedsValidatorCap => 1724,
+        ValidationError::FeeExceedsAggregateCap => 1725,
+        ValidationError::FeeExceedsAmount => 1726,
+        ValidationError::FeeSlotMathInvalid => 1727,
+        ValidationError::OracleVBCTooOld => 1728,
+        ValidationError::OracleInsufficientStake => 1729,
+        ValidationError::OracleStakeScarred => 1730,
+        ValidationError::ReceiptCommitmentMismatch => 1731,
+        ValidationError::FactChainEmpty => 1732,
+        ValidationError::FactAmountOverflow => 1733,
+        ValidationError::BurnTargetMismatch => 1734,
+        ValidationError::HealNotNeeded => 1735,
+        ValidationError::CoreIdMismatch => 1736,
+        ValidationError::SenderWalletIdMismatch => 1737,
+        ValidationError::ArkOnlineTradeRejected => 1738,
+        ValidationError::ArkReceiverWitnessMissing => 1739,
+        ValidationError::ArkReceiverWitnessInvalid => 1740,
+        ValidationError::ArkK0NablaConfirmationForbidden => 1741,
+        ValidationError::ArkSenderProofMissing => 1742,
+        ValidationError::ArkSenderProofInvalid => 1743,
+        ValidationError::DevAccountForbiddenFromValidator => 1744,
+        ValidationError::MvibEmptyAdmissionSet => 1745,
+        ValidationError::MvibInvalidAdmissionSetSize => 1746,
+        ValidationError::MvibDuplicateIssuer => 1747,
+        ValidationError::MvibInvalidSignature => 1748,
+        ValidationError::MvibInvalidTick => 1749,
+        ValidationError::ClaraInvalidSignature => 1750,
+        ValidationError::ClaraWalletPkMismatch => 1751,
+        ValidationError::ClaraStateNotGarbage => 1752,
+        ValidationError::ClaraNbcTrustFailed => 1753,
+        ValidationError::ClaraEmptyGarbage => 1754,
+        ValidationError::ConsolePhaseOutInvalid => 1755,
+        ValidationError::TxidPhasedOut => 1756,
+        ValidationError::RedeemRegistrationIncomplete => 1757,
+        ValidationError::GenesisClaimInvalidSeq => 1758,
+        ValidationError::StakeLocked => 1759,
+        ValidationError::StakeLockPairUnmintable => 1760,
+        ValidationError::StakeFloor => 1761,
+        ValidationError::WalletFormatInvalid => 1762,
+        ValidationError::StakeLockNoAttestedTick => 1763,
+        ValidationError::StakeLockTimeDisagreement => 1764,
+        ValidationError::TxVelocityTooFast => 1765,
+        ValidationError::GenesisClaimInvalidAmount => 1766,
+        ValidationError::ValidatorJoinNoProvisionalVbc => 1767,
+        ValidationError::ValidatorJoinVbcNotProvisional => 1768,
+        ValidationError::ValidatorJoinVbcNotBound => 1769,
+        ValidationError::ValidatorJoinVbcInvalid => 1770,
+        ValidationError::GenesisClaimWalletAlreadyFunded => 1771,
+        ValidationError::GenesisNablaBlessingMissing => 1772,
+        ValidationError::DomainMismatch => 1773,
+        ValidationError::WalletHibernating => 1774,
+        ValidationError::OodsAttestationInvalid => 1775,
+        ValidationError::OodsUnhealthyRetry => 1776,
+        ValidationError::RecallAttestationInvalid => 1777,
+        ValidationError::OooConfirmationInvalid => 1778,
+        ValidationError::FobClaimInvalid => 1779,
+        ValidationError::ArkChargeScarred => 1780,
+        ValidationError::ReceiverStateNotAnchored => 1781,
+        // YPX-007 §9.4 (KI#125) — mode ZkpQualify refusals.
+        ValidationError::ZkqMissingRequest => 1782,
+        ValidationError::ZkqMissingSigner => 1783,
+        ValidationError::ZkqNodeMismatch => 1784,
+        ValidationError::ZkqTooSlow => 1785,
+        ValidationError::ZkqChallengeMismatch => 1786,
+        // NO catch-all (2026-10-02): this match is EXHAUSTIVE, so a new
+        // `ValidationError` variant without a code is a COMPILE error here, and
+        // `every_validation_error_round_trips_through_its_code` (below) fails if
+        // its decode arm is missing. The old `_ => 9900` is how 82 variants went
+        // unmapped without anyone noticing.
     }
 }
 
@@ -769,6 +932,21 @@ fn u64_to_ve(n: u64) -> Result<ValidationError, String> {
         505 => Ok(ValidationError::VBCRootKeyMismatch),
         506 => Ok(ValidationError::DuplicateValidator),
         507 => Ok(ValidationError::InvalidVBCCount),
+        508 => Ok(ValidationError::VBCProvisionalCannotServe { issued_at: 0, expires_at: 0 }),
+        510 => Ok(ValidationError::VBCNoAttestedTick),
+        511 => Ok(ValidationError::VBCIssuerCertMissing),
+        512 => Ok(ValidationError::VBCIssuerCannotIssue),
+        513 => Ok(ValidationError::VBCIssuerNoLineage),
+        514 => Ok(ValidationError::VBCIssuersShareLineage),
+        515 => Ok(ValidationError::VBCLineageNotAdopted),
+        520 => Ok(ValidationError::Cl8MissingBundle),
+        521 => Ok(ValidationError::Cl8MissingIssuerKey),
+        522 => Ok(ValidationError::Cl8SignerNotInIssuerSet),
+        523 => Ok(ValidationError::Cl8ProvisionalLifetimeInvalid),
+        524 => Ok(ValidationError::Cl8IssuerKeyUnusable),
+        525 => Ok(ValidationError::Cl8SigningFailed),
+        526 => Ok(ValidationError::Cl8VerifyAfterSignFailed),
+        527 => Ok(ValidationError::Cl8OodsStampMismatch),
         600 => Ok(ValidationError::MissingPrevReceipts),
         601 => Ok(ValidationError::InvalidGenesisTransaction),
         700 => Ok(ValidationError::InvalidExecutionProof),
@@ -789,8 +967,6 @@ fn u64_to_ve(n: u64) -> Result<ValidationError, String> {
         921 => Ok(ValidationError::SABROverlapNotInPrev),
         922 => Ok(ValidationError::SABRMissingValidatorPK),
         923 => Ok(ValidationError::SABRHashMismatch),
-        950 => Ok(ValidationError::AuthHashRequired),
-        951 => Ok(ValidationError::InvalidAuthProof),
         960 => Ok(ValidationError::ReceiptFromWrongWorldline),
         961 => Ok(ValidationError::ReceiptLineageMismatch),
         970 => Ok(ValidationError::GroupTooManyMembers),
@@ -806,6 +982,11 @@ fn u64_to_ve(n: u64) -> Result<ValidationError, String> {
         1003 => Ok(ValidationError::FactInvalidSignature),
         1004 => Ok(ValidationError::FactDuplicateWitness),
         1005 => Ok(ValidationError::FactInvalidCheckpoint),
+        1006 => Ok(ValidationError::FactWitnessUncertified),
+        1007 => Ok(ValidationError::FactOriginInvalid),
+        1008 => Ok(ValidationError::FactCertificateInvalid),
+        1009 => Ok(ValidationError::FactBurnSigInvalid),
+        1011 => Ok(ValidationError::StakeClaimTierInvalid),
         1020 => Ok(ValidationError::BurnNoFactChain),
         1021 => Ok(ValidationError::BurnMissingTarget),
         1022 => Ok(ValidationError::BurnTargetNotFound),
@@ -819,10 +1000,8 @@ fn u64_to_ve(n: u64) -> Result<ValidationError, String> {
         1010 => Ok(ValidationError::MissingWalletState),
         853 => Ok(ValidationError::MissingExecutionProof),
         854 => Ok(ValidationError::MissingVBC),
-        930 => Ok(ValidationError::ZkpNotQualified),
         931 => Ok(ValidationError::ArkNotImplemented),
         1040 => Ok(ValidationError::VersionMismatch),
-        1050 => Ok(ValidationError::MissingDilithiumKey),
         1051 => Ok(ValidationError::MissingField),
         1060 => Ok(ValidationError::WalletSecretMismatch),
         1100 => Ok(ValidationError::OracleSenderMismatch),
@@ -851,12 +1030,121 @@ fn u64_to_ve(n: u64) -> Result<ValidationError, String> {
         1302 => Ok(ValidationError::ArkToNonArkRejected),
         1303 => Ok(ValidationError::ArkChargeNotOwner),
         1304 => Ok(ValidationError::ArkUnloadScarred),
-        1310 => Ok(ValidationError::NablaWriterDetected),
-        1311 => Ok(ValidationError::StakeWalletMismatch),
-        1312 => Ok(ValidationError::StakeNablaSignatureInvalid),
-        1313 => Ok(ValidationError::StakeStateMismatch),
-        1314 => Ok(ValidationError::StakeInsufficientReceipts),
-        1315 => Ok(ValidationError::StakeProofExpired),
+        // 1310-1316 retired 2026-10-02 (KI#249) — never reassign.
+        1317 => Ok(ValidationError::VbcNotRegistered),
+        1318 => Ok(ValidationError::VbcStampInvalid),
+        1319 => Ok(ValidationError::VbcCandidacyPulseMissing),
+        1320 => Ok(ValidationError::VbcCandidacyPulseInvalid),
+        1321 => Ok(ValidationError::VbcCandidacyPulseUntimed), // KI#158
+        // 1400-1405, 1500-1509, 1600 were ENCODE-ONLY until 2026-10-02: the
+        // encoder mapped them, the decoder did not, so e.g. every CL11
+        // `ConsoleInvalidPick` output frame failed `decode_outputs`. Found by
+        // `every_validation_error_round_trips_through_its_code`.
+        1400 => Ok(ValidationError::ReferenceTooLarge),
+        1401 => Ok(ValidationError::GroupMemberMismatch),
+        1403 => Ok(ValidationError::SelfSendRejected),
+        1404 => Ok(ValidationError::ReceiverAddressRequired),
+        1405 => Ok(ValidationError::InvalidReceiverAddress),
+        1500 => Ok(ValidationError::ConsoleInvalidGeneration),
+        1501 => Ok(ValidationError::ConsoleChainMismatch),
+        1502 => Ok(ValidationError::ConsoleInvalidSeatCount),
+        1503 => Ok(ValidationError::ConsoleDuplicateSeat),
+        1504 => Ok(ValidationError::ConsoleTermMismatch),
+        1505 => Ok(ValidationError::ConsoleInvalidTermLength),
+        1506 => Ok(ValidationError::ConsoleInvalidSelector),
+        1507 => Ok(ValidationError::ConsoleInvalidPick),
+        1508 => Ok(ValidationError::ConsoleIncompleteSelection),
+        1509 => Ok(ValidationError::ConsoleNotMember),
+        1600 => Ok(ValidationError::GenesisStakeLocked),
+        // 1700-1781: the 2026-10-02 block (see `ve_to_u64`). Struct variants decode
+        // to the zero-context sentinel form, as 501/502/508 do.
+        1700 => Ok(ValidationError::StateNotAnchored),
+        1701 => Ok(ValidationError::VBCUnusableSoon { expires_at: 0, current_tick: 0 }),
+        1702 => Ok(ValidationError::VBCStaleAttestation { attested_tick: 0, prev_tick: 0 }),
+        1703 => Ok(ValidationError::VBCLifetimeTooLong { expires_at: 0, issued_at: 0 }),
+        1704 => Ok(ValidationError::VbcRenewalNoProofOfWork),
+        1705 => Ok(ValidationError::VbcRenewalNotCoSigned),
+        1706 => Ok(ValidationError::VbcRenewalWorkReceiptStale),
+        1707 => Ok(ValidationError::VbcRenewalWorkReceiptSubQuorum),
+        1708 => Ok(ValidationError::GenesisNameReserved),
+        1709 => Ok(ValidationError::RedeemSenderAnchorMissing),
+        1710 => Ok(ValidationError::RedeemBeforeCommitPropagated),
+        1711 => Ok(ValidationError::TxidAttestationMissing),
+        1712 => Ok(ValidationError::TxidAttestationInvalidSig),
+        1713 => Ok(ValidationError::TxidAttestationRedeemed),
+        1714 => Ok(ValidationError::TxidAttestationBadStatus),
+        1715 => Ok(ValidationError::TxidAttestationUntrusted),
+        1716 => Ok(ValidationError::ChequeClaimProofMissing),
+        1717 => Ok(ValidationError::ChequeClaimProofInvalidSig),
+        1718 => Ok(ValidationError::ChequeClaimProofUnauthenticated),
+        1719 => Ok(ValidationError::ChequeClaimProofTxidMismatch),
+        1720 => Ok(ValidationError::ChequeClaimProofReceiverMismatch),
+        1721 => Ok(ValidationError::ChequeClaimProofUntrusted),
+        1722 => Ok(ValidationError::TxidAlreadyInReceiverChain),
+        1723 => Ok(ValidationError::ChequeClaimProofExpired),
+        1724 => Ok(ValidationError::FeeExceedsValidatorCap),
+        1725 => Ok(ValidationError::FeeExceedsAggregateCap),
+        1726 => Ok(ValidationError::FeeExceedsAmount),
+        1727 => Ok(ValidationError::FeeSlotMathInvalid),
+        1728 => Ok(ValidationError::OracleVBCTooOld),
+        1729 => Ok(ValidationError::OracleInsufficientStake),
+        1730 => Ok(ValidationError::OracleStakeScarred),
+        1731 => Ok(ValidationError::ReceiptCommitmentMismatch),
+        1732 => Ok(ValidationError::FactChainEmpty),
+        1733 => Ok(ValidationError::FactAmountOverflow),
+        1734 => Ok(ValidationError::BurnTargetMismatch),
+        1735 => Ok(ValidationError::HealNotNeeded),
+        1736 => Ok(ValidationError::CoreIdMismatch),
+        1737 => Ok(ValidationError::SenderWalletIdMismatch),
+        1738 => Ok(ValidationError::ArkOnlineTradeRejected),
+        1739 => Ok(ValidationError::ArkReceiverWitnessMissing),
+        1740 => Ok(ValidationError::ArkReceiverWitnessInvalid),
+        1741 => Ok(ValidationError::ArkK0NablaConfirmationForbidden),
+        1742 => Ok(ValidationError::ArkSenderProofMissing),
+        1743 => Ok(ValidationError::ArkSenderProofInvalid),
+        1744 => Ok(ValidationError::DevAccountForbiddenFromValidator),
+        1745 => Ok(ValidationError::MvibEmptyAdmissionSet),
+        1746 => Ok(ValidationError::MvibInvalidAdmissionSetSize),
+        1747 => Ok(ValidationError::MvibDuplicateIssuer),
+        1748 => Ok(ValidationError::MvibInvalidSignature),
+        1749 => Ok(ValidationError::MvibInvalidTick),
+        1750 => Ok(ValidationError::ClaraInvalidSignature),
+        1751 => Ok(ValidationError::ClaraWalletPkMismatch),
+        1752 => Ok(ValidationError::ClaraStateNotGarbage),
+        1753 => Ok(ValidationError::ClaraNbcTrustFailed),
+        1754 => Ok(ValidationError::ClaraEmptyGarbage),
+        1755 => Ok(ValidationError::ConsolePhaseOutInvalid),
+        1756 => Ok(ValidationError::TxidPhasedOut),
+        1757 => Ok(ValidationError::RedeemRegistrationIncomplete),
+        1758 => Ok(ValidationError::GenesisClaimInvalidSeq),
+        1759 => Ok(ValidationError::StakeLocked),
+        1760 => Ok(ValidationError::StakeLockPairUnmintable),
+        1761 => Ok(ValidationError::StakeFloor),
+        1762 => Ok(ValidationError::WalletFormatInvalid),
+        1763 => Ok(ValidationError::StakeLockNoAttestedTick),
+        1764 => Ok(ValidationError::StakeLockTimeDisagreement),
+        1765 => Ok(ValidationError::TxVelocityTooFast),
+        1766 => Ok(ValidationError::GenesisClaimInvalidAmount),
+        1767 => Ok(ValidationError::ValidatorJoinNoProvisionalVbc),
+        1768 => Ok(ValidationError::ValidatorJoinVbcNotProvisional),
+        1769 => Ok(ValidationError::ValidatorJoinVbcNotBound),
+        1770 => Ok(ValidationError::ValidatorJoinVbcInvalid),
+        1771 => Ok(ValidationError::GenesisClaimWalletAlreadyFunded),
+        1772 => Ok(ValidationError::GenesisNablaBlessingMissing),
+        1773 => Ok(ValidationError::DomainMismatch),
+        1774 => Ok(ValidationError::WalletHibernating),
+        1775 => Ok(ValidationError::OodsAttestationInvalid),
+        1776 => Ok(ValidationError::OodsUnhealthyRetry),
+        1777 => Ok(ValidationError::RecallAttestationInvalid),
+        1778 => Ok(ValidationError::OooConfirmationInvalid),
+        1779 => Ok(ValidationError::FobClaimInvalid),
+        1780 => Ok(ValidationError::ArkChargeScarred),
+        1781 => Ok(ValidationError::ReceiverStateNotAnchored),
+        1782 => Ok(ValidationError::ZkqMissingRequest),
+        1783 => Ok(ValidationError::ZkqMissingSigner),
+        1784 => Ok(ValidationError::ZkqNodeMismatch),
+        1785 => Ok(ValidationError::ZkqTooSlow),
+        1786 => Ok(ValidationError::ZkqChallengeMismatch),
         9998 => Ok(ValidationError::InvalidMode),
         9999 => Ok(ValidationError::InternalError),
         _ => Err(format!("unknown ValidationError code: {}", n)),
@@ -879,7 +1167,7 @@ fn tx_to_value(tx: &Transaction) -> Value {
         (7, cbor_u64(tx.nonce)),
         (8, cbor_u64(tx.epoch)),
         (9, cbor_bytes(&tx.client_sig)),
-        (10, cbor_opt(&tx.owner_proof, |z| cbor_bytes(z))),
+        // Key 10 ("azkp" — owner_proof) RETIRED 2026-09-25 (KI#108); never reassign.
         (11, cbor_opt(&tx.scar_passcode, |p| cbor_u64(*p as u64))),
         (12, cbor_opt(&tx.burn_target_tx_id, |b| cbor_bytes(b))),
         (13, cbor_u64(tx.required_k as u64)),
@@ -933,7 +1221,6 @@ fn value_to_tx(val: &Value) -> Result<Transaction, String> {
         nonce: val_u64(require_field(m, 7, "nonce")?)?,
         epoch: val_u64(require_field(m, 8, "epoch")?)?,
         client_sig: val_bytes(require_field(m, 9, "csig")?)?,
-        owner_proof: val_opt(require_field(m, 10, "azkp")?, val_bytes)?,
         scar_passcode: val_opt(require_field(m, 11, "scar")?, val_u32)?,
         burn_target_tx_id: val_opt(require_field(m, 12, "burn_target")?, val_bytes32)?,
         recall_target_tx_id: val_opt(require_field(m, 17, "recall_target")?, val_bytes32)?,
@@ -960,6 +1247,8 @@ fn value_to_tx(val: &Value) -> Result<Transaction, String> {
         // sentinel; CL2 Step -1.5 skips the check.
         core_id: [0u8; 32],
         kind: TxKind::Normal,
+        // IPC codec is conformance-only and does not round-trip discriminants
+        // (kind is hardcoded Normal above); settlement rides the serde/AVM path.
     })
 }
 
@@ -1023,10 +1312,9 @@ fn value_to_receipt(val: &Value) -> Result<Receipt, String> {
             .iter().map(value_to_wsig).collect::<Result<Vec<_>,_>>()?,
         epoch: val_u64(require_field(m, 9, "epoch")?)?,
         fact_proof: val_opt(require_field(m, 10, "fproof")?, value_to_fact_proof)?,
-        required_k: m.iter()
-            .find(|(k, _)| matches!(k, Value::Integer(i) if i128::from(*i) == 11))
-            .map(|(_, v)| val_u64(v).unwrap_or(3) as u8)
-            .unwrap_or(3),
+        // YP §17.3.1.4 v2.19.0 (KI#150): a receipt without its k is refused —
+        // defaulting to 3 let a k=5 artifact be presented as k=3 by omission.
+        required_k: val_u64(require_field(m, 11, "rk")?)? as u8,
         receipt_commitment: val_bytes32(require_field(m, 12, "rcmit")?)?,
         // IPC codec doesn't carry core_id yet; all-zero sentinel.
         core_id: [0u8; 32],
@@ -1038,6 +1326,11 @@ fn value_to_receipt(val: &Value) -> Result<Receipt, String> {
         is_dev_class: false,
         // Same conformance-only treatment as is_dev_class (YPX-021 §8.2).
         oods_flag: None,
+        confidence_index: None,
+        // §32.3 — conformance/multi-host IPC path does not round-trip the
+        // Core-computed sender lineage (same treatment as oods_flag above);
+        // production carries it via the direct in-memory AVM path.
+        sender_state: None,
     })
 }
 
@@ -1117,6 +1410,9 @@ fn ws_to_value(ws: &WalletState) -> Value {
         })),
         (6, cbor_opt(&ws.wallet_id, |wid| Value::Text(wid.clone()))),
         (7, cbor_u64(ws.hibernation_until)), // YPX-020 — thread both ways or it drifts over IPC
+        (8, cbor_u64(ws.emission_claimed_epoch)), // §4.2a — same rule: thread both ways
+        (9, cbor_u64(ws.stake_floor_until)),       // §6b.13 — required both ways
+        (10, blob_encode(&ws.wallet_format)),      // §6b.13 — required both ways
     ];
     cbor_map(pairs)
 }
@@ -1137,6 +1433,11 @@ fn value_to_ws(val: &Value) -> Result<WalletState, String> {
         })?,
         // YPX-020 — default 0 if absent (pre-hibernation peers); encoder always writes it.
         hibernation_until: get_map_field(m, 7).map(val_u64).transpose()?.unwrap_or(0),
+        wall_clock_lock: 0,
+        // §4.2a — default 0 if absent; encoder always writes it.
+        emission_claimed_epoch: get_map_field(m, 8).map(val_u64).transpose()?.unwrap_or(0),
+        stake_floor_until: val_u64(require_field(m, 9, "floor")?)?,
+        wallet_format: blob_decode::<WalletFormat>(require_field(m, 10, "wfmt")?)?,
     })
 }
 
@@ -1192,7 +1493,8 @@ fn fact_link_to_value(fl: &FactLink) -> Value {
         (4, cbor_u64(fl.tick)),
         (5, cbor_array(fl.witnesses.iter().map(fact_witness_to_value).collect())),
         (6, cbor_opt(&fl.nabla_confirmation, blob_encode)),
-        (7, cbor_opt(&fl.receiver_contact, receiver_contact_to_value)),
+        // Key 7 RETIRED 2026-09-15 (receiver_contact, removed with the YPX-001
+        // §1.5.3 push path). Reserved; do not reuse. Old maps carrying it still decode.
         (8, cbor_opt(&fl.burn_proof, blob_encode)),
         (9, cbor_u64(fl.required_k as u64)),
         (10, cbor_opt(&fl.sender_anchor, |b: &[u8; 32]| cbor_bytes(b))),
@@ -1202,6 +1504,10 @@ fn fact_link_to_value(fl: &FactLink) -> Value {
         (13, cbor_array(fl.inherited_scar_resolutions.iter().map(blob_encode).collect())),
         // YPX-001 §1.5.4 burn-target binding (2026-07-17)
         (14, cbor_opt(&fl.burn_target_tx_id, |b: &[u8; 32]| cbor_bytes(b))),
+        // YPX-010 §11 receiver-as-witness (k=0 Ark trade; None on online links)
+        (15, cbor_opt(&fl.receiver_witness, blob_encode)),
+        // KI#59 out-of-order own-scar confirmation (post-round; None on build)
+        (16, cbor_opt(&fl.out_of_order_confirmation, blob_encode)),
     ];
     cbor_map(pairs)
 }
@@ -1213,17 +1519,21 @@ fn value_to_fact_link(val: &Value) -> Result<FactLink, String> {
         previous_state_id: val_bytes32(require_field(m, 1, "psid")?)?,
         new_state_id: val_bytes32(require_field(m, 2, "nsid")?)?,
         amount: val_u64(require_field(m, 3, "amt")?)?,
-        required_k: require_field(m, 9, "rk").ok().and_then(|v| val_u64(v).ok()).unwrap_or(3) as u8,
+        // KI#150: a link without its k is refused (see the Receipt decoder).
+        required_k: val_u64(require_field(m, 9, "rk")?)? as u8,
         tick: val_u64(require_field(m, 4, "tick")?)?,
         witnesses: val_array(require_field(m, 5, "w")?)?
             .iter().map(value_to_fact_witness).collect::<Result<Vec<_>,_>>()?,
         nabla_confirmation: val_opt(require_field(m, 6, "nabla")?, blob_decode::<NablaConfirmation>)?,
-        receiver_contact: val_opt(require_field(m, 7, "rc")?, value_to_receiver_contact)?,
         burn_proof: val_opt(require_field(m, 8, "bp")?, blob_decode::<BurnProof>)?,
         sender_anchor: val_opt(require_field(m, 10, "sa")?, val_bytes32)?,
         // YPX-022: round-trip the recall scar-resolution proof (graceful if absent).
         recall_proof: require_field(m, 11, "rp").ok()
             .and_then(|v| val_opt(v, blob_decode::<axiom_core_logic::types::RecallAttestation>).ok())
+            .flatten(),
+        // KI#59: round-trip the out-of-order own-scar confirmation (graceful if absent).
+        out_of_order_confirmation: require_field(m, 16, "ooo").ok()
+            .and_then(|v| val_opt(v, blob_decode::<axiom_core_logic::types::OutOfOrderConfirmation>).ok())
             .flatten(),
         // IPC codec is conformance-only; embedded-AVM path serializes
         // is_dev_class via serde. Default to false here; do NOT use
@@ -1246,6 +1556,10 @@ fn value_to_fact_link(val: &Value) -> Result<FactLink, String> {
         burn_target_tx_id: require_field(m, 14, "btt").ok()
             .and_then(|v| val_opt(v, val_bytes32).ok())
             .flatten(),
+        // YPX-010 §11 receiver-as-witness (k=0 Ark trade). Absent → None.
+        receiver_witness: require_field(m, 15, "rw").ok()
+            .and_then(|v| val_opt(v, blob_decode::<axiom_core_logic::types::ReceiverWitness>).ok())
+            .flatten(),
     })
 }
 
@@ -1254,6 +1568,7 @@ fn fact_witness_to_value(fw: &FactWitness) -> Value {
         (0, cbor_bytes(&fw.validator_id)),
         (1, cbor_bytes(&fw.validator_pk)),
         (2, cbor_bytes(&fw.signature)),
+        (3, cbor_bytes(&fw.vbc_hash)),  // YP §26.17.6.5 B2 certificate reference
     ];
     cbor_map(pairs)
 }
@@ -1264,7 +1579,7 @@ fn value_to_fact_witness(val: &Value) -> Result<FactWitness, String> {
         validator_id: val_bytes32(require_field(m, 0, "vid")?)?,
         validator_pk: val_bytes(require_field(m, 1, "vpk")?)?,
         signature: val_bytes(require_field(m, 2, "sig")?)?,
-        vbc_genesis_anchor: None, // L5: IPC codec doesn't carry anchor yet
+        vbc_hash: require_field(m, 3, "vh").ok().and_then(|v| val_bytes32(v).ok()).unwrap_or([0u8; 32]),
     })
 }
 
@@ -1328,26 +1643,6 @@ fn value_to_fact_proof(val: &Value) -> Result<FactProof, String> {
 }
 
 // ============================================================================
-// ReceiverContact
-// ============================================================================
-
-fn receiver_contact_to_value(rc: &ReceiverContact) -> Value {
-    let pairs = vec![
-        (0, cbor_text(&rc.wallet_id)),
-        (1, cbor_text(&rc.email)),
-    ];
-    cbor_map(pairs)
-}
-
-fn value_to_receiver_contact(val: &Value) -> Result<ReceiverContact, String> {
-    let m = val_map(val)?;
-    Ok(ReceiverContact {
-        wallet_id: val_text(require_field(m, 0, "wid")?)?,
-        email: val_text(require_field(m, 1, "email")?)?,
-    })
-}
-
-// ============================================================================
 // OPAQUE BLOB — for complex nested types (VBC, Cheque, Attestation, Hint, Nabla)
 // Encode with ciborium serde → CBOR bytes. Core parses internally.
 // ============================================================================
@@ -1371,13 +1666,92 @@ fn blob_decode<T: serde::de::DeserializeOwned>(val: &Value) -> Result<T, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `ValidationError` variant, enumerated from the type ITSELF (serde's
+    /// "unknown variant …, expected one of …" list), so this test cannot fall
+    /// behind the enum the way the codec did: until 2026-10-02 82 variants had
+    /// no code and crossed as the 9900 catch-all that `u64_to_ve` cannot decode.
+    fn all_validation_error_variants() -> Vec<ValidationError> {
+        let mut probe = Vec::new();
+        ciborium::ser::into_writer(&"__no_such_variant__", &mut probe).unwrap();
+        let err = ciborium::de::from_reader::<ValidationError, _>(probe.as_slice())
+            .expect_err("a bogus variant name must not decode");
+        let msg = format!("{err:?}");
+        let list = msg.split("expected one of").nth(1)
+            .unwrap_or_else(|| panic!("serde did not list the variants: {msg}"));
+        let names: Vec<&str> = list.split('`').skip(1).step_by(2).collect();
+        assert!(names.len() > 100, "variant list looks truncated ({}): {msg}", names.len());
+        names.into_iter().map(|name| {
+            // Struct variants: the wire carries the code alone, so the decoded
+            // form is the zero-context sentinel — build exactly that.
+            let z = |a: &str, b: &str| -> Value {
+                Value::Map(vec![(Value::Text(name.into()), Value::Map(vec![
+                    (Value::Text(a.into()), Value::Integer(0u64.into())),
+                    (Value::Text(b.into()), Value::Integer(0u64.into())),
+                ]))])
+            };
+            let v = match name {
+                "VBCExpired" | "VBCUnusableSoon" => z("expires_at", "current_tick"),
+                "VBCNotYetValid" => z("issued_at", "current_tick"),
+                "VBCStaleAttestation" => z("attested_tick", "prev_tick"),
+                "VBCLifetimeTooLong" | "VBCProvisionalCannotServe" => z("expires_at", "issued_at"),
+                _ => Value::Text(name.into()),
+            };
+            v.deserialized::<ValidationError>().unwrap_or_else(|e| panic!(
+                "variant {name}: {e} — a NEW struct variant needs its zero form here"))
+        }).collect()
+    }
+
+    /// The codec's contract (2026-10-02): every variant has its OWN code, no code
+    /// is 9900, and every code decodes back to the variant (struct variants to
+    /// their zero-context sentinel).
+    #[test]
+    fn every_validation_error_round_trips_through_its_code() {
+        let all = all_validation_error_variants();
+        let mut seen = std::collections::BTreeMap::new();
+        for v in &all {
+            let code = ve_to_u64(v);
+            assert_ne!(code, 9900, "{v:?} has no code (the retired catch-all)");
+            if let Some(prev) = seen.insert(code, format!("{v:?}")) {
+                panic!("code {code} is used by both {prev} and {v:?}");
+            }
+            assert_eq!(u64_to_ve(code).as_ref(), Ok(v),
+                "{v:?} encodes to {code}, which does not decode back to it");
+        }
+        // Retired codes stay retired.
+        for retired in [860u64, 861, 862, 863, 864, 930, 950, 951, 1050, 1310, 1311, 1312, 1313,
+                        1314, 1315, 1316, 1402, 9900] {
+            assert!(u64_to_ve(retired).is_err(), "retired code {retired} decodes");
+        }
+    }
+
+    /// KI#49 / the conformance corpus — the CL5 reason the generator emits for a
+    /// redeem without a claim proof now crosses as ITSELF and survives
+    /// `decode_outputs` (it used to be the undecodable 9900).
+    #[test]
+    fn cheque_claim_proof_missing_survives_the_outputs_frame() {
+        let e = ValidationError::ChequeClaimProofMissing;
+        assert_eq!(ve_to_u64(&e), 1716);
+        let mut out = make_minimal_outputs();
+        out.result = ValidationResult::Reject;
+        out.rejection_reason = Some(e.clone());
+        let decoded = decode_outputs(&encode_outputs(&out).unwrap()).expect("decodes");
+        assert_eq!(decoded.rejection_reason, Some(e));
+    }
+
+    /// KI#158 — 1321 crosses the Core↔Lambda boundary as itself, not the 9900 fallback.
+    #[test]
+    fn candidacy_pulse_untimed_round_trips_as_1321() {
+        let e = ValidationError::VbcCandidacyPulseUntimed;
+        assert_eq!(ve_to_u64(&e), 1321);
+        assert_eq!(u64_to_ve(1321).unwrap(), e);
+    }
     use axiom_core_logic::{
         PublicInputs, PublicOutputs, CoreLogicMode, ValidationResult, ValidationError,
     };
     use axiom_core_logic::types::{
         Transaction, Receipt, WitnessSig, WalletState, GroupMember,
-        FactChain, FactCheckpoint, FactLink, FactWitness, ReceiverContact,
-    };
+        FactChain, FactCheckpoint, FactLink, FactWitness, };
 
     // ----- helpers to build minimal real types -----
 
@@ -1394,7 +1768,6 @@ mod tests {
             nonce: 42,
             epoch: 1,
             client_sig: vec![3u8; 64],
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             oracle_claim: None,
@@ -1430,6 +1803,12 @@ mod tests {
 
     fn make_receipt() -> Receipt {
         Receipt {
+            // §32.3 received-from lineage (CoreID 89c85944, 2026-08-11). These
+            // two fixtures were never updated when the field landed, so
+            // `cargo test -p axiom-core-ipc` has not compiled since — which is
+            // why full-mode preflight (`cargo test --workspace`) was red on
+            // master. Codec round-trip fixtures: None is the pre-lineage shape.
+            sender_state: None,
             txid: [20u8; 32],
             state_hash: [21u8; 32],
             produced_state_id: [22u8; 32],
@@ -1447,6 +1826,7 @@ mod tests {
             fee_breakdown: Vec::new(),
             is_dev_class: false,
             oods_flag: None,
+            confidence_index: None,
         }
     }
 
@@ -1460,16 +1840,27 @@ mod tests {
             wallet_id: None,
             group_members: None,
             hibernation_until: 0,
+            // §5.2.2c validator stake lock — BOTH deadlines, zero = no lock.
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         }
     }
 
     fn make_minimal_inputs() -> PublicInputs {
         PublicInputs {
+            zkq_request: None,
+            fact_certificates: Vec::new(),
             mode: CoreLogicMode::CL1,
+            receiver_witness: None,
+            receiver_signing_key: None,
             transaction: make_tx(),
             prev_receipts: vec![],
             current_state: None,
             vbc_bundle: None,
+            // §5.2.2b — a credential PRESENTED as admission, distinct from
+            // `vbc_bundle` (the cert being acted on). None on a plain CL1.
+            claimant_vbc: None,
             cheque_bundle: None,
             receiver_pk: None,
             receiver_current_balance: None,
@@ -1492,12 +1883,8 @@ mod tests {
             audit_confirmation: None,
             nonce_response: None,
             audit_response: None,
-            scar_heal_tx_id: None,
-            scar_heal_nabla_id: None,
-            scar_heal_root_hash: None,
             wallet_secret: None,
             fanout_message: None,
-            candidate_balance: None,
             nabla_stake_proof: None,
             frozen_wallets: None,
             console_current_cert: None,
@@ -1512,16 +1899,28 @@ mod tests {
             current_tick: 0,
             local_core_id: [0u8; 32],
         
-            withdrawal_inputs: None,
             oods_attestation: None,
             recall_attestation: None,
+        // fob_claim_attestation: same treatment — direct-AVM-path only.
+        fob_claim_attestation: None,
             receiver_current_hibernation: None,
+            receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None, // §4.2a — same IPC treatment as the two above
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
         }
     }
 
     fn make_minimal_outputs() -> PublicOutputs {
         PublicOutputs {
+            zkp_qualification: None,
+            sender_state: None, // §32.3 — see make_receipt above
+            // §5.2.2c — no lock: only a subsidy claim's redeem stamps one.
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             result: ValidationResult::Accept,
+            ark_send_fact_chain: None,
             new_state_hash: None,
             produced_state_id: None,
             new_wallet_seq: None,
@@ -1535,7 +1934,6 @@ mod tests {
             zkp_nonce_hash: None,
             required_k: 0,
             receipt_commitment: None,
-            validator_withdrawal_mint: None,
             extracted_proof_type: 0,
             audit_demand: None,
             audit_request: None,
@@ -1549,12 +1947,85 @@ mod tests {
             is_dev_class: None,
             hibernation_until: 0,
             oods_flag: None,
+            confidence_index: None,
         }
     }
 
     // ================================================================
     // 1. Roundtrip encode/decode for PublicInputs (minimal)
     // ================================================================
+    /// The rejection code is the ONLY thing that survives the wire — a
+    /// reimplementer sees 508, never the Rust variant. So both directions of
+    /// the mapping must exist, and a variant added to `ve_to_u64` without its
+    /// `u64_to_ve` arm decodes as a hard error at the far end.
+    ///
+    /// Codes are explicit numbers here, NOT enum discriminants, which is why
+    /// `VBCProvisionalCannotServe` could be filed at the end of
+    /// `ValidationError` (no positional shift) while keeping 508 beside the
+    /// VBC family. This test is what makes that claim checkable.
+    #[test]
+    fn vbc_provisional_rejection_code_roundtrips_both_ways() {
+        let e = ValidationError::VBCProvisionalCannotServe {
+            issued_at: 1_700_000_000,
+            expires_at: 1_700_043_200,
+        };
+        assert_eq!(ve_to_u64(&e), 508, "the wire code is 508 (VBC family)");
+        // The wire carries the code alone, so the decoded value is the
+        // zero-context sentinel form — same convention as VBCExpired (501).
+        assert_eq!(
+            u64_to_ve(508).expect("508 must decode"),
+            ValidationError::VBCProvisionalCannotServe { issued_at: 0, expires_at: 0 },
+        );
+        // 508 must not collide with the VBC family it sits beside.
+        for taken in [500u64, 501, 502, 503, 504, 505, 506, 507] {
+            assert_ne!(ve_to_u64(&e), taken, "508 collides with an existing VBC code");
+        }
+    }
+
+    /// The §5.3 / CL8 refusal codes must survive the wire in BOTH directions
+    /// and must not collide.
+    ///
+    /// These variants exist ONLY to be told apart — they all used to be
+    /// `InvalidVBC` (500), which is why a refused certificate request could
+    /// not be diagnosed from outside the guest. A variant that encodes to a
+    /// number nothing decodes reproduces exactly that: the far end sees a hard
+    /// error instead of the reason, and the observability is gone again.
+    #[test]
+    fn validator_join_rejection_codes_roundtrip_and_do_not_collide() {
+        let cases: &[(ValidationError, u64)] = &[
+            (ValidationError::VBCNoAttestedTick, 510),
+            (ValidationError::VBCIssuerCertMissing, 511),
+            (ValidationError::VBCIssuerCannotIssue, 512),
+            (ValidationError::VBCIssuerNoLineage, 513),
+            (ValidationError::VBCIssuersShareLineage, 514),
+            (ValidationError::VBCLineageNotAdopted, 515),
+            (ValidationError::Cl8MissingBundle, 520),
+            (ValidationError::Cl8MissingIssuerKey, 521),
+            (ValidationError::Cl8SignerNotInIssuerSet, 522),
+            (ValidationError::Cl8ProvisionalLifetimeInvalid, 523),
+            (ValidationError::Cl8IssuerKeyUnusable, 524),
+            (ValidationError::Cl8SigningFailed, 525),
+            (ValidationError::Cl8VerifyAfterSignFailed, 526),
+            (ValidationError::Cl8OodsStampMismatch, 527),
+        ];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (variant, code) in cases {
+            assert_eq!(ve_to_u64(variant), *code, "{variant:?} must encode to {code}");
+            assert_eq!(
+                u64_to_ve(*code).unwrap_or_else(|_| panic!("{code} must decode")),
+                *variant,
+                "{code} must decode back to the variant that produced it",
+            );
+            assert!(seen.insert(*code), "code {code} is used twice");
+            // The whole point: none of them may fall back to InvalidVBC.
+            assert_ne!(
+                ve_to_u64(variant), ve_to_u64(&ValidationError::InvalidVBC),
+                "{variant:?} must be distinguishable from a bare InvalidVBC",
+            );
+        }
+    }
+
     #[test]
     fn roundtrip_inputs_minimal() {
         let inputs = make_minimal_inputs();
@@ -1607,9 +2078,6 @@ mod tests {
         inputs.my_validator_id = Some([45u8; 32]);
         inputs.fact_witness_sigs = vec![make_wsig()];
         inputs.zkp_nonce = Some([46u8; 32]);
-        inputs.scar_heal_tx_id = Some([47u8; 32]);
-        inputs.scar_heal_nabla_id = Some([48u8; 32]);
-        inputs.scar_heal_root_hash = Some([49u8; 32]);
 
         let encoded = encode_inputs(&inputs).expect("encode");
         let decoded = decode_inputs(&encoded).expect("decode");
@@ -1627,9 +2095,6 @@ mod tests {
         assert_eq!(decoded.overlapped_signatures.len(), 1);
         assert_eq!(decoded.group_member_index, Some(2));
         assert_eq!(decoded.zkp_nonce, Some([46u8; 32]));
-        assert_eq!(decoded.scar_heal_tx_id, Some([47u8; 32]));
-        assert_eq!(decoded.scar_heal_nabla_id, Some([48u8; 32]));
-        assert_eq!(decoded.scar_heal_root_hash, Some([49u8; 32]));
     }
 
     // ================================================================
@@ -1750,7 +2215,6 @@ mod tests {
         inputs.transaction.nonce = 99;
         inputs.transaction.epoch = 100;
         inputs.transaction.client_sig = vec![0xCC; 96];
-        inputs.transaction.owner_proof = Some(vec![0xDD; 256]);
         inputs.transaction.scar_passcode = Some(123456);
         inputs.transaction.burn_target_tx_id = Some([0xEE; 32]);
         inputs.transaction.required_k = 5;
@@ -1770,7 +2234,6 @@ mod tests {
         assert_eq!(tx.nonce, 99);
         assert_eq!(tx.epoch, 100);
         assert_eq!(tx.client_sig, vec![0xCC; 96]);
-        assert_eq!(tx.owner_proof, Some(vec![0xDD; 256]));
         assert_eq!(tx.scar_passcode, Some(123456));
         assert_eq!(tx.burn_target_tx_id, Some([0xEE; 32]));
         assert_eq!(tx.required_k, 5);
@@ -1817,6 +2280,7 @@ mod tests {
             CoreLogicMode::CL1, CoreLogicMode::CL2, CoreLogicMode::CL3,
             CoreLogicMode::CL4, CoreLogicMode::CL5,
             CoreLogicMode::CL7, CoreLogicMode::CL8,
+            CoreLogicMode::ZkpQualify,
         ];
         for mode in &modes {
             let mut inputs = make_minimal_inputs();
@@ -1870,7 +2334,7 @@ mod tests {
                     validator_id: [63u8; 32],
                     validator_pk: vec![64u8; 48],
                     signature: vec![65u8; 64],
-                    vbc_genesis_anchor: None,
+                    vbc_hash: [0u8; 32],
                 }],
                 pending_links: 0,
             }),
@@ -1885,20 +2349,18 @@ mod tests {
                     validator_id: [73u8; 32],
                     validator_pk: vec![74u8; 48],
                     signature: vec![75u8; 64],
-                    vbc_genesis_anchor: None,
+                    vbc_hash: [0u8; 32],
                 }],
                 nabla_confirmation: None,
-                receiver_contact: Some(ReceiverContact {
-                    wallet_id: "bob@example.com/ccdd3344".into(),
-                    email: "bob@example.com".into(),
-                }),
                 burn_proof: None,
                 burn_target_tx_id: None,
                 sender_anchor: None,
                 is_dev_class: false,
                 inherited_scar_txids: Vec::new(),
                 inherited_scar_resolutions: Vec::new(),
+                receiver_witness: None,
                 recall_proof: None,
+                out_of_order_confirmation: None,
             }],
         });
 
@@ -1919,9 +2381,6 @@ mod tests {
         assert_eq!(link.tick, 42);
         assert_eq!(link.witnesses.len(), 1);
         assert_eq!(link.witnesses[0].validator_id, [73u8; 32]);
-        let rc = link.receiver_contact.as_ref().unwrap();
-        assert_eq!(rc.wallet_id, "bob@example.com/ccdd3344");
-        assert_eq!(rc.email, "bob@example.com");
     }
 
     // ================================================================
@@ -1943,6 +2402,9 @@ mod tests {
                 GroupMember { member_pk: vec![84u8; 32], share_bps: 2000, available: 400_000 },
             ]),
             hibernation_until: 0,
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         });
 
         let encoded = encode_inputs(&inputs).expect("encode");

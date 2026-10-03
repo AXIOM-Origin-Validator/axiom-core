@@ -20,6 +20,14 @@ fn build_cl1_inputs(
     tx: axiom_core_logic::types::Transaction,
 ) -> PublicInputs {
     PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        claimant_vbc: None,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
         oods_attestation: None,
         recall_attestation: None,
         receiver_current_hibernation: None,
@@ -38,6 +46,8 @@ fn build_cl1_inputs(
         overlapped_signatures: vec![],
         group_member_index: None,
         sender_fact_chain: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         receiver_fact_chain: None,
         my_dilithium_sk: None,
         my_dilithium_pk: None,
@@ -49,12 +59,8 @@ fn build_cl1_inputs(
         audit_confirmation: None,
         nonce_response: None,
         audit_response: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -68,7 +74,6 @@ fn build_cl1_inputs(
         phase_out_era_end_ticks: vec![],
         phase_out_blocked_era_ids: vec![],
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         max_fact_links: None,
         current_tick: 0,
     
@@ -82,6 +87,14 @@ fn build_cl2_inputs_with_receipts(
     prev_receipts: Vec<Receipt>,
 ) -> PublicInputs {
     PublicInputs {
+        zkq_request: None,
+        fact_certificates: Vec::new(),
+        claimant_vbc: None,
+        receiver_current_wall_clock_lock: None,
+        receiver_current_emission_claimed_epoch: None,
+        receiver_current_stake_floor_until: None,
+        receiver_current_wallet_format: None,
+        fob_claim_attestation: None,
         oods_attestation: None,
         recall_attestation: None,
         receiver_current_hibernation: None,
@@ -100,6 +113,8 @@ fn build_cl2_inputs_with_receipts(
         overlapped_signatures: vec![],
         group_member_index: None,
         sender_fact_chain: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         receiver_fact_chain: None,
         my_dilithium_sk: None,
         my_dilithium_pk: None,
@@ -111,12 +126,8 @@ fn build_cl2_inputs_with_receipts(
         audit_confirmation: None,
         nonce_response: None,
         audit_response: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -130,7 +141,6 @@ fn build_cl2_inputs_with_receipts(
         phase_out_era_end_ticks: vec![],
         phase_out_blocked_era_ids: vec![],
         local_core_id: [0u8; 32],
-        withdrawal_inputs: None,
         max_fact_links: None,
         current_tick: 0,
     
@@ -188,11 +198,16 @@ fn adversarial_stale_vbc_expired_timestamps() {
         signatures: vec![vec![0u8; 64]; 3],
         max_tx: 0,
         founding_vbc_hash: [0u8; 32],
+        // §5.3 — a depth-0 cert declares no adopted lineage; genesis membership
+        // is derived from `GENESIS_VALIDATORS`, not stated here.
+        genesis_lineage: [0u8; 32],
+        nabla_registration: None,
     };
 
     let bundle = VBCProofBundle {
         target_vbc: stale_vbc,
         supporting_vbcs: vec![],
+        candidacy_pulse: None, renewal_work_receipt: None,
     };
 
     // Current time far after expiry
@@ -231,6 +246,8 @@ fn adversarial_zero_commitment_hash_receipt() {
 
     let forged_receipt = Receipt {
         oods_flag: None,
+        confidence_index: None,
+        sender_state: None,
         txid: [0x42; 32],
         state_hash: [0u8; 32],
         produced_state_id: alice.state_id, // Chain to current state
@@ -306,7 +323,7 @@ fn adversarial_zero_commitment_hash_receipt() {
 
     // Call validate_witnesses directly to test the zero commitment_hash
     // rejection at validation.rs line 915 without other CL2 checks
-    // (like AuthHashRequired) firing first.
+    // firing first.
     let tx = alice.create_transaction(&bob.address(), 500_000, "zero-commit", 1);
 
     let inputs = build_cl2_inputs_with_receipts(
@@ -353,11 +370,43 @@ fn adversarial_self_send_same_email_rejected() {
     assert_rejected(&outputs, ValidationError::SelfSendRejected);
 }
 
+/// KI#181 — the first fixed-key wallet with `email` whose ADDRESS differs from
+/// `other`'s. Deterministic for a given WALLET_IDENTITY_KEY; never flaky.
+fn same_email_distinct_address(other: &TestWallet, email: &str, balance: u64) -> TestWallet {
+    (0u8..=255)
+        .map(|i| { let mut k = [0xB2u8; 32]; k[0] = i; TestWallet::from_ed25519_key(email, k, balance) })
+        .find(|w| w.address() != other.address())
+        .expect("256 distinct keys cannot all share one address")
+}
+
 #[test]
 fn adversarial_self_send_different_suffix_same_email() {
-    // Same email but different wallet_id suffix — still a self-send
-    let alice = TestWallet::generate("alice@selfsend2.com", 10_000_000_000);
-    let bob = TestWallet::generate("alice@selfsend2.com", 0); // Same email, different keys
+    // SINGLE-KEYPAIR RULING (2026-07-17, YPX-010 §10.2): "same owner" is the
+    // shared pk (`verify_pk_binding`), NOT the email string. Two DIFFERENT
+    // keypairs that happen to share an email are two different owners — the
+    // wallet_id checksums are pk-bound, so this is an ordinary send between
+    // distinct wallets and must ACCEPT. (Pre-ruling this test asserted
+    // SelfSendRejected off the email-string comparison — the exact
+    // over-complication the ruling removed; it had been failing since
+    // 05b75ec4.) The true self-send rejection — same pk, own address — is
+    // pinned by `adversarial_self_send_same_email_rejected` above (same keypair, own address).
+    //
+    // KI#181 (2026-10-01): this test flaked ~1 in 256 runs. The fixture salt is
+    // the fixed "42" (`axiom-test-utils`), and the address checksum covers
+    // email + identity key + salt + tier but NOT the pk — so two random keys
+    // with one email differ only in the 8-bit `pk_bind`, and with p = 1/256 the
+    // "different" receiver string WAS alice's own address. Core then correctly
+    // answered SelfSendRejected (it judges the receiver STRING; YPX-010 §10.2).
+    // Core is right; the fixture was not testing what it claims. Fixed keys and
+    // a deterministic search for a bob whose address differs — a search, not
+    // one fixed pair, because the ceremony replaces WALLET_IDENTITY_KEY and
+    // runs this suite: a single fixed pair would have a 1/256 chance of a
+    // deterministic red there. (In production the salt derives from the key,
+    // so a same-email collision needs 2^-16 — the KI#216 short-address ruling.)
+    let alice = TestWallet::from_ed25519_key("alice@selfsend2.com", [0xA1; 32], 10_000_000_000);
+    let bob = same_email_distinct_address(&alice, "alice@selfsend2.com", 0); // Same email, different keys
+    assert_ne!(alice.address(), bob.address(),
+        "precondition: the receiver must NOT be alice's own address string");
 
     let tx = alice.create_transaction(&bob.address(), 500_000, "self-send-2", 1);
 
@@ -366,7 +415,9 @@ fn adversarial_self_send_different_suffix_same_email() {
     alice.sign_transaction(&mut inputs.transaction);
 
     let outputs = execute_core(inputs);
-    assert_rejected(&outputs, ValidationError::SelfSendRejected);
+    assert_eq!(outputs.result, ValidationResult::Accept,
+        "different pk = different owner: not a self-send (§10.2), got {:?}",
+        outputs.rejection_reason);
 }
 
 // ===========================================================================

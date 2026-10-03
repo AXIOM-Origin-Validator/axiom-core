@@ -13,6 +13,16 @@ crate-type = ["cdylib", "rlib"]
 default = ["std"]
 ceremony = []   # Exposes signing functions for ceremony/NBC issuance tools
 dev-mode = []   # Bypasses G1 compile guard + enables dev stubs. NEVER in production.
+# ╔═ BOOTSTRAP SUBSIDY — REMOVE WHEN POOLS DRAIN ═══════════════╗
+# Removal act 1 of 2: drop this feature and the compiler finds every piece of
+# subsidy LOGIC (§5.2.5). Free, any time. Act 2 — retiring the wire variants —
+# is a CoreID rotation and can wait for one that is happening anyway.
+# OFF by default so "the mesh compiles and works without the subsidy" is
+# verified continuously rather than assumed; preflight builds both ways.
+# ⚠ The TxKind variants and their canonical-CBOR emits are NOT gated by this
+# and must never be — two builds of one source would be two protocol versions.
+# ╚═════════════════════════════════════════════════════════════╝
+bootstrap-subsidy = []
 std = [
     "blake3/std",
     "ed25519-dalek/std",
@@ -61,7 +71,7 @@ ciborium = { workspace = true }
 # Touching the art bytes rebuilds the ELF → new CoreID across the
 # network — that is the canary signal for the AXC/L$/atom conversion
 # lib's consolidation.
-axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0", default-features = false }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1", default-features = false }
 
 # Transport encryption (host only — gated to the `std` feature).  These
 # are *optional* deps so the AVM-guest (no_std) build excludes them

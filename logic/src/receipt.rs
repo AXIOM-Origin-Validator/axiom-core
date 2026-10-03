@@ -77,6 +77,11 @@ pub struct SendReceiptInputs {
     /// `NablaOodsAttestation`. Callers MUST pass `PublicOutputs.oods_flag`
     /// verbatim — the same value Core bound into `receipt_commitment`.
     pub oods_flag: Option<crate::types::OodsFlag>,
+    /// P3.6 — the Core-computed CI factors for a k=3 send (`ark::compute_ci_factors`),
+    /// stamped into the receipt and bound into `receipt_commitment`. `None` on every
+    /// non-k=3 send path (heal / genesis / mint). Redeem receipts never carry a CI
+    /// (`build_redeem_receipt` passes `None`).
+    pub confidence_index: Option<crate::types::ConfidenceIndex>,
 }
 
 /// Inputs for [`build_redeem_receipt`] — used by CL5 redeem and the
@@ -121,6 +126,12 @@ pub struct RedeemReceiptInputs {
     /// YPX-021 §8.2 — see `SendReceiptInputs::oods_flag`. Pass
     /// `PublicOutputs.oods_flag` verbatim from the CL5 run.
     pub oods_flag: Option<crate::types::OodsFlag>,
+    /// YP §32.3 — the sender's `state_id` this redeem draws from (FACT
+    /// `sender_anchor`). Pass `PublicOutputs.sender_state` verbatim from the
+    /// CL5 run; bound into `receipt_commitment` and carried to Nabla for
+    /// taint lineage. `None` only on the degenerate no-sender redeem
+    /// (genesis self-claim).
+    pub sender_state: Option<[u8; 32]>,
 }
 
 /// Inputs for [`build_heal_receipt`] — used by the heal-burn CL3 path.
@@ -145,6 +156,8 @@ pub fn build_send_receipt(inputs: SendReceiptInputs) -> Receipt {
         inputs.epoch,
         inputs.is_dev_class,
         inputs.oods_flag.as_ref(),
+        inputs.confidence_index.as_ref(),
+        None, // send / heal / genesis: no external sender lineage (§32.3)
     );
     Receipt {
         txid: inputs.txid,
@@ -164,6 +177,8 @@ pub fn build_send_receipt(inputs: SendReceiptInputs) -> Receipt {
         fee_breakdown: empty_fees,
         is_dev_class: inputs.is_dev_class,
         oods_flag: inputs.oods_flag,
+        confidence_index: inputs.confidence_index,
+        sender_state: None, // §32.3 — send/heal/genesis carry no sender lineage
     }
 }
 
@@ -184,6 +199,8 @@ pub fn build_redeem_receipt(inputs: RedeemReceiptInputs) -> Receipt {
         REDEEM_EPOCH,
         inputs.is_dev_class,
         inputs.oods_flag.as_ref(),
+        None, // redeem receipts never carry a CI (only k=3 sends stamp one)
+        inputs.sender_state.as_ref(), // §32.3 — the FACT sender_anchor lineage
     );
     Receipt {
         txid: inputs.cheque_txid,
@@ -203,6 +220,8 @@ pub fn build_redeem_receipt(inputs: RedeemReceiptInputs) -> Receipt {
         fee_breakdown: inputs.fee_breakdown,
         is_dev_class: inputs.is_dev_class,
         oods_flag: inputs.oods_flag,
+        confidence_index: None,
+        sender_state: inputs.sender_state, // §32.3 taint lineage
     }
 }
 
@@ -229,6 +248,8 @@ pub fn verify_receipt_commitment(receipt: &Receipt) -> bool {
         receipt.epoch,
         receipt.is_dev_class,
         receipt.oods_flag.as_ref(),
+        receipt.confidence_index.as_ref(),
+        receipt.sender_state.as_ref(),
     );
     receipt.receipt_commitment == expected
 }
@@ -248,6 +269,7 @@ mod tests {
     fn send_receipt_is_deterministic() {
         let inputs1 = SendReceiptInputs {
             oods_flag: None,
+            confidence_index: None,
             txid: [0xaa; 32],
             state_hash: [0xbb; 32],
             produced_state_id: [0xcc; 32],
@@ -261,6 +283,7 @@ mod tests {
         };
         let inputs2 = SendReceiptInputs {
             oods_flag: None,
+            confidence_index: None,
             txid: [0xaa; 32],
             state_hash: [0xbb; 32],
             produced_state_id: [0xcc; 32],
@@ -288,6 +311,7 @@ mod tests {
         let supplied_state_hash = [0xAB; 32];
         let inputs = RedeemReceiptInputs {
             oods_flag: None,
+            sender_state: None,
             cheque_txid: [0x11; 32],
             produced_state_id: [0x22; 32],
             new_wallet_seq: 5,
@@ -312,6 +336,7 @@ mod tests {
     fn receipt_commitment_matches_cl2_recompute() {
         let inputs = SendReceiptInputs {
             oods_flag: None,
+            confidence_index: None,
             txid: [0xee; 32],
             state_hash: [0u8; 32],
             produced_state_id: [0xff; 32],
@@ -333,6 +358,7 @@ mod tests {
     fn tampered_receipt_fails_verify() {
         let inputs = SendReceiptInputs {
             oods_flag: None,
+            confidence_index: None,
             txid: [0x01; 32],
             state_hash: [0x02; 32],
             produced_state_id: [0x03; 32],

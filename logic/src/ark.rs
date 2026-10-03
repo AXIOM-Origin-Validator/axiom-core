@@ -63,6 +63,14 @@ pub const STAKES_SAFE_MULTIPLIER: u64 = 10;
 pub const STAKES_MODERATE_MULTIPLIER: u64 = 3;
 // Below MODERATE = THIN (1-3x). Below 1x = UNDERWATER (always RED).
 
+// ── Liveness gate L (paper3 §7.1 / §6) ────────────────────────────────────
+
+/// The Δ, in seconds, past which a sender's last-k=3 anchor is "unexplained-stale"
+/// WHEN the receiver has measured the network to be live (a Nabla-attested current
+/// tick). Same second-basis as compute_staleness. Small by design: the demo only
+/// needs a Cold sender to exceed it. §6 calibration knob.
+pub const L_DELTA_SECS: u64 = 10;
+
 // ── CI status levels ───────────────────────────────────────────────────────
 
 /// Confidence Index status (YPX-010 §4)
@@ -150,16 +158,132 @@ pub fn is_amount_anomalous(current_amount: u64, mean_amount: u64) -> bool {
     current_amount > mean_amount.saturating_mul(3)
 }
 
+// ── CI factor readers (YPX-010 §3.4 / BUILD_ARK §3.4) ─────────────────────
+
+/// P3.6 §3.4 — read the five CI factors + override flags from a sender's FACT chain.
+///
+/// Runs at an ONLINE k=3 send: `k3_balance` / `k3_tick` are the CURRENT k=3 state (this
+/// send is the freshest last-k=3 the receiver will later measure live staleness
+/// against), and `prior_chain` is the sender's chain BEFORE this send's link. Everything
+/// else is derived from the chain through existing accessors — no new chain state. Core
+/// stamps the result into the sender's k=3 receipt (the P3.6 commitment binding) so the
+/// k witnesses sign the factors; the offline receiver then verifies those signatures and
+/// recomputes the SAME factors from the SAME chain to confirm they match (§11.6). The
+/// receiver adds the live staleness factor itself (`evaluate_ci`'s `live_tick`) — no
+/// past signature can carry "now."
+pub fn compute_ci_factors(
+    prior_chain: &crate::types::FactChain,
+    wallet_pk: &[u8],
+    k3_balance: u64,
+    k3_tick: u64,
+) -> ConfidenceIndex {
+    use crate::wallet_id::K_ARK;
+    let links = &prior_chain.links;
+
+    // Index of the most recent k≥3 (online-settled) link. k=0 links AFTER it are the
+    // "since last k=3" offline spends the receiver weighs as Factor 2.
+    let last_k3_idx = links
+        .iter()
+        .rposition(|l| (l.required_k as usize) >= crate::fact::MIN_FACT_WITNESSES);
+
+    // Factor 2: Ark (k=0) tx count since the last k=3 (whole chain if never online).
+    let ark_tx_count_since_k3 = match last_k3_idx {
+        Some(i) => links[i + 1..].iter().filter(|l| l.required_k == K_ARK).count() as u64,
+        None => links.iter().filter(|l| l.required_k == K_ARK).count() as u64,
+    };
+
+    // Factor 4: mean amount of prior Ark (k=0) links (0 if none).
+    let (ark_sum, ark_n) = links
+        .iter()
+        .filter(|l| l.required_k == K_ARK)
+        .fold((0u128, 0u64), |(s, n), l| (s + l.amount as u128, n + 1));
+    let ark_tx_mean_amount = if ark_n > 0 { (ark_sum / ark_n as u128) as u64 } else { 0 };
+
+    // Factor 5: distinct validators that witnessed prior links (ecosystem depth).
+    let mut seen: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
+    for l in links {
+        for w in &l.witnesses {
+            if !seen.iter().any(|v| v == &w.validator_id) {
+                seen.push(w.validator_id);
+            }
+        }
+    }
+    let ark_validator_count = seen.len().min(u8::MAX as usize) as u8;
+
+    // Overrides (§3). A scar on the presented k=3 chain is disqualifying; the wallet
+    // has done a k=3 iff it is doing one now (k3_tick set) or its chain already carries
+    // one. `conflict_count` is a Nabla-layer ban signal (a caught double-spend surfaces
+    // as the settlement fork-ban, §12.3, not on an honest verifying chain) → 0 here.
+    let has_any_k3 = k3_tick > 0 || last_k3_idx.is_some();
+    // §10.4.1 scoping (BUILD §3.4): the scar OVERRIDE reads the presented k=3
+    // chain only — an unresolved k=0 (Ark) link is the NORMAL state of every
+    // not-yet-settled offline trade and already feeds Factor 2 via
+    // `ark_tx_count_since_k3`; counting it here would hard-RED every second
+    // consecutive offline spend.
+    let has_fact_scar = links
+        .iter()
+        .any(|l| l.required_k != K_ARK && !l.is_resolved());
+
+    ConfidenceIndex {
+        wallet_pk: wallet_pk.to_vec(),
+        last_k3_at: k3_tick,
+        ark_tx_count_since_k3,
+        k3_balance,
+        ark_tx_mean_amount,
+        ark_validator_count,
+        has_fact_scar,
+        has_any_k3,
+        conflict_count: 0,
+        // The Core-stamped CI is authenticated by the receipt's k-witness signatures
+        // (P3.6), NOT a separate Lambda-issued CI credential (retired, Phase 0).
+        validator_signature: alloc::vec::Vec::new(),
+        issuer_validator_pk: alloc::vec::Vec::new(),
+    }
+}
+
 // ── CI evaluation (YPX-010 §3-4) ──────────────────────────────────────────
 
-/// Evaluate the full 5-factor Confidence Index from a CI struct.
+/// Evaluate the Confidence Index: the 5 sender-derived factors (YPX-010) plus the
+/// receiver's liveness gate L (paper3 §7.1).
 ///
-/// This is the core evaluation function. The receiver computes the CI from
-/// the sender's FACT chain, then calls this to get GREEN/YELLOW/RED.
+/// This is the core evaluation function. The receiver computes the CI factors from
+/// the sender's FACT chain and supplies its OWN `live_tick` measurement, then calls
+/// this to get GREEN/YELLOW/RED. `live_tick = None` means the receiver is also dark
+/// (L neutral); `Some(t)` means the receiver reached the network and t is the
+/// Nabla-attested current tick.
+///
+/// `sender_nabla_healthy` is the sender's carried Nabla health — the receiver reads
+/// it from the presented k=3 receipt's `oods_flag.healthy` (YPX-021). It is
+/// **TIGHTEN-ONLY** (paper3 v0.18 §6): `false` applies one conservative step-down
+/// to the final score and can never raise it, and it can never rescue the L clamp
+/// (`receiver-live ∧ sender-stale → RED` fires first regardless). One-directional
+/// on purpose: the flag is self-inducible (a sender can self-eclipse its Nabla view),
+/// so honoring `healthy == false` as an *excuse* for staleness would hand the sender
+/// a switch to disable L. Health corroborates a deeper outage; it never explains one
+/// away.
 ///
 /// Core is the law — this function is the sole authority on CI status.
-pub fn evaluate_ci(ci: &ConfidenceIndex, current_time: u64, ark_amount: u64) -> CIStatus {
+pub fn evaluate_ci(
+    ci: &ConfidenceIndex,
+    current_time: u64,
+    ark_amount: u64,
+    live_tick: Option<u64>,
+    sender_nabla_healthy: bool,
+) -> CIStatus {
     // === Unconditional overrides (YPX-010 §3) ===
+
+    // Liveness gate L (paper3 §7.1) — the receiver's OWN measurement, not sender data,
+    // so it is a parameter, not a ConfidenceIndex field. `live_tick` is the Nabla-attested
+    // current tick IFF the receiver reached the network (None = both dark). When the world
+    // is provably live and the sender's last k=3 is stale beyond Δ, the staleness is
+    // *unexplained* → RED, regardless of the sender's history/ecosystem strength. This is
+    // placed with the unconditional overrides ON PURPOSE: it must fire before the
+    // compensatory base_ci matrix that otherwise caps a strong-but-stale sender at YELLOW.
+    if let Some(t) = live_tick {
+        if t.saturating_sub(ci.last_k3_at) > L_DELTA_SECS {
+            return CIStatus::Red;
+        }
+    }
 
     // FACT scar present → always RED
     if ci.has_fact_scar {
@@ -204,7 +328,10 @@ pub fn evaluate_ci(ci: &ConfidenceIndex, current_time: u64, ark_amount: u64) -> 
     };
 
     // === Settlement modifier (YPX-010 §4.5) ===
-    apply_settlement_modifier(base_ci, ecosystem)
+    let scored = apply_settlement_modifier(base_ci, ecosystem);
+
+    // === Sender-health tighten (paper3 v0.18 §6 — TIGHTEN-ONLY) ===
+    apply_sender_health_tighten(scored, sender_nabla_healthy)
 }
 
 fn evaluate_fresh(stakes: StakesLevel, anomalous: bool, ecosystem: EcosystemDepth) -> CIStatus {
@@ -254,6 +381,25 @@ fn evaluate_cold(tx: ArkTxLevel, stakes: StakesLevel, eco: EcosystemDepth) -> CI
         (ArkTxLevel::High, StakesLevel::Moderate, EcosystemDepth::Deep) => CIStatus::Yellow,
         (ArkTxLevel::Medium, StakesLevel::Safe, EcosystemDepth::Deep) => CIStatus::Yellow,
         _ => CIStatus::Red,
+    }
+}
+
+/// Sender-health tighten (paper3 v0.18 §6 / YPX-010 reframe). An unhealthy sender
+/// Nabla view (`oods_flag.healthy == false` on the presented k=3 receipt)
+/// corroborates a deeper outage → ONE conservative step-down of the final score.
+/// Monotone by construction: the healthy branch is the identity and the unhealthy
+/// branch only lowers, so no input can score HIGHER by carrying `healthy = false` —
+/// and the L clamp (an early `return Red` in `evaluate_ci`) is untouchable from
+/// here because RED maps to RED. Tighten-only; see the `evaluate_ci` doc-comment
+/// for why the flag must never loosen.
+fn apply_sender_health_tighten(base: CIStatus, sender_nabla_healthy: bool) -> CIStatus {
+    if sender_nabla_healthy {
+        return base;
+    }
+    match base {
+        CIStatus::Green => CIStatus::Yellow,
+        CIStatus::Yellow => CIStatus::Red,
+        CIStatus::Red => CIStatus::Red,
     }
 }
 
@@ -374,7 +520,66 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::string::String;
-    use crate::types::Transaction;
+    use crate::types::{Transaction, FactChain, FactLink, FactWitness};
+
+    // P3.6 §3.4 — the factor reader derives Ark-since-k=3 count, mean amount, distinct
+    // validators, and the scar override from a sender's chain; k=3 balance/tick are the
+    // caller's current online state.
+    #[test]
+    fn compute_ci_factors_reads_chain() {
+        let link = |required_k: u8, amount: u64, vids: &[u8], resolved: bool| {
+            let witnesses = vids.iter().map(|&b| FactWitness {
+                validator_id: [b; 32], validator_pk: vec![0u8; 8],
+                signature: vec![0u8; 8], vbc_hash: [0u8; 32],
+            }).collect();
+            FactLink {
+                tx_id: [amount as u8; 32], previous_state_id: [0u8; 32], new_state_id: [1u8; 32],
+                amount, required_k, tick: 100, witnesses,
+                // resolved => a Nabla confirmation (online) makes is_resolved() true.
+                nabla_confirmation: if resolved { Some(crate::types::NablaConfirmation {
+                    nabla_node_id: [9u8; 32], nabla_signature: vec![0u8; 64],
+                    root_hash: [0u8; 32], synced_to_tick: 1, ..Default::default() }) } else { None },
+                burn_proof: None, burn_target_tx_id: None,
+                sender_anchor: None, is_dev_class: false, recall_proof: None, out_of_order_confirmation: None,
+                inherited_scar_txids: vec![], inherited_scar_resolutions: vec![],
+                receiver_witness: None,
+            }
+        };
+        // history: a k=3 settled link (validators 1,2,3), then two k=0 offline links.
+        let chain = FactChain {
+            checkpoint: None,
+            links: vec![
+                link(3, 1_000, &[1, 2, 3], true),  // last k=3
+                link(0, 400, &[], false),          // k=0 offline (unresolved scar)
+                link(0, 600, &[], false),          // k=0 offline
+            ],
+        };
+        let ci = compute_ci_factors(&chain, &[7u8; 32], 50_000, 999);
+
+        assert_eq!(ci.last_k3_at, 999, "last_k3_at = the current k=3 tick");
+        assert_eq!(ci.k3_balance, 50_000);
+        assert_eq!(ci.ark_tx_count_since_k3, 2, "two k=0 links after the last k=3");
+        assert_eq!(ci.ark_tx_mean_amount, 500, "(400+600)/2");
+        assert_eq!(ci.ark_validator_count, 3, "validators 1,2,3 distinct");
+        assert!(ci.has_any_k3);
+        // §10.4.1 scoping (BUILD §3.4): unresolved k=0 links are the NORMAL
+        // state of unsettled offline trades — they feed Factor 2 (counted
+        // above), NOT the scar override. Only a k≥3 scar disqualifies.
+        assert!(!ci.has_fact_scar, "unresolved k=0 links must NOT trip the scar override");
+        assert_eq!(ci.conflict_count, 0);
+        assert!(ci.validator_signature.is_empty(), "Core-stamped CI is receipt-signed, not credential-signed");
+
+        // An unresolved k≥3 link IS the scar override.
+        let scarred = FactChain {
+            checkpoint: None,
+            links: vec![
+                link(3, 1_000, &[1, 2, 3], false), // k=3, UNRESOLVED → scar
+                link(0, 400, &[], false),
+            ],
+        };
+        let ci2 = compute_ci_factors(&scarred, &[7u8; 32], 50_000, 999);
+        assert!(ci2.has_fact_scar, "an unresolved k≥3 link is the §3 scar override");
+    }
 
     fn make_test_ci(last_k3_at: u64) -> ConfidenceIndex {
         ConfidenceIndex {
@@ -405,7 +610,6 @@ mod tests {
             reference: "ark test".to_string(),
             nonce: 42,
             epoch: 1,
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             recall_target_tx_id: None,
@@ -484,28 +688,28 @@ mod tests {
     fn test_override_fact_scar() {
         let mut ci = make_test_ci(1000000);
         ci.has_fact_scar = true;
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Red);
     }
 
     #[test]
     fn test_override_no_k3() {
         let mut ci = make_test_ci(1000000);
         ci.has_any_k3 = false;
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Red);
     }
 
     #[test]
     fn test_override_conflicts() {
         let mut ci = make_test_ci(1000000);
         ci.conflict_count = 1;
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Red);
     }
 
     #[test]
     fn test_override_underwater() {
         let mut ci = make_test_ci(1000000);
         ci.k3_balance = 5_000; // less than ark_amount
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Red);
     }
 
     // ── Matrix tests — FRESH ───────────────────────────────────────────
@@ -514,14 +718,14 @@ mod tests {
     fn test_fresh_safe_deep_green() {
         let ci = make_test_ci(1000000);
         // Fresh (100s ago), Safe (100x), Deep (3 validators)
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Green);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Green);
     }
 
     #[test]
     fn test_fresh_thin_yellow() {
         let mut ci = make_test_ci(1000000);
         ci.k3_balance = 15_000; // Thin (1.5x)
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Yellow);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Yellow);
     }
 
     // ── Matrix tests — WARM ────────────────────────────────────────────
@@ -530,7 +734,7 @@ mod tests {
     fn test_warm_high_safe_deep_green() {
         let ci = make_test_ci(1000000);
         // Warm (3600s = 1h), High (20 TXs), Safe (100x), Deep (3)
-        assert_eq!(evaluate_ci(&ci, 1003600, 10_000), CIStatus::Green);
+        assert_eq!(evaluate_ci(&ci, 1003600, 10_000, None, true), CIStatus::Green);
     }
 
     #[test]
@@ -538,14 +742,14 @@ mod tests {
         let mut ci = make_test_ci(1000000);
         ci.ark_tx_count_since_k3 = 0;
         ci.k3_balance = 15_000; // Thin
-        assert_eq!(evaluate_ci(&ci, 1003600, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1003600, 10_000, None, true), CIStatus::Red);
     }
 
     #[test]
     fn test_warm_anomalous_red() {
         let ci = make_test_ci(1000000);
         // Warm, but amount is 10x mean (anomalous)
-        assert_eq!(evaluate_ci(&ci, 1003600, 100_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1003600, 100_000, None, true), CIStatus::Red);
     }
 
     // ── Matrix tests — STALE ───────────────────────────────────────────
@@ -554,14 +758,14 @@ mod tests {
     fn test_stale_high_safe_deep_green() {
         let ci = make_test_ci(1000000);
         // Stale (30000s = 8.3h), High (20), Safe (100x), Deep (3)
-        assert_eq!(evaluate_ci(&ci, 1030000, 10_000), CIStatus::Green);
+        assert_eq!(evaluate_ci(&ci, 1030000, 10_000, None, true), CIStatus::Green);
     }
 
     #[test]
     fn test_stale_low_any_red() {
         let mut ci = make_test_ci(1000000);
         ci.ark_tx_count_since_k3 = 2; // Low
-        assert_eq!(evaluate_ci(&ci, 1030000, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1030000, 10_000, None, true), CIStatus::Red);
     }
 
     // ── Matrix tests — COLD ────────────────────────────────────────────
@@ -570,7 +774,7 @@ mod tests {
     fn test_cold_high_safe_deep_yellow() {
         let ci = make_test_ci(1000000);
         // Cold (100000s = 27h), High (20), Safe (100x), Deep (3) → YELLOW (not GREEN)
-        assert_eq!(evaluate_ci(&ci, 1100000, 10_000), CIStatus::Yellow);
+        assert_eq!(evaluate_ci(&ci, 1100000, 10_000, None, true), CIStatus::Yellow);
     }
 
     #[test]
@@ -578,7 +782,7 @@ mod tests {
         let mut ci = make_test_ci(1000000);
         ci.ark_tx_count_since_k3 = 10; // Medium
         ci.k3_balance = 50_000; // Moderate (5x)
-        assert_eq!(evaluate_ci(&ci, 1100000, 10_000), CIStatus::Red);
+        assert_eq!(evaluate_ci(&ci, 1100000, 10_000, None, true), CIStatus::Red);
     }
 
     // ── Settlement modifier tests ──────────────────────────────────────
@@ -588,7 +792,7 @@ mod tests {
         let mut ci = make_test_ci(1000000);
         ci.ark_validator_count = 2; // Shallow
         // Would be GREEN (Fresh + Safe), but Shallow downgrades
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Yellow);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Yellow);
     }
 
     #[test]
@@ -599,7 +803,7 @@ mod tests {
         // BUT: Unknown + significant amount → RED override
         // Use small amount to avoid override
         ci.ark_tx_mean_amount = 100_000;
-        assert_eq!(evaluate_ci(&ci, 1000100, 10_000), CIStatus::Yellow);
+        assert_eq!(evaluate_ci(&ci, 1000100, 10_000, None, true), CIStatus::Yellow);
     }
 
     // ── Artifact tests ─────────────────────────────────────────────────
@@ -644,5 +848,101 @@ mod tests {
         let h = compute_artifact_hash(&a1);
         let a2 = make_test_artifact(3, Some(h));
         assert_eq!(verify_artifact_structure(&a2, Some(&a1)), Err(ArkError::NonceTooLow));
+    }
+
+    /// Exhaustive enumeration over the FULL `evaluate_ci` input grid — the
+    /// "catch everything" check for a pure decision function (more complete
+    /// than a model check: every reachable state is actually evaluated).
+    /// Locked invariants (paper3 v0.18 §6 / YPX-010):
+    ///   (i)   scar / no-k=3-ever / underwater stakes  ⇒ RED, always
+    ///   (ii)  receiver-live ∧ sender-stale (> Δ)      ⇒ RED, always (the L clamp)
+    ///   (iii) `sender_nabla_healthy = false` never scores HIGHER than the
+    ///         identical inputs with `true` (monotone tighten-only)
+    ///   (iv)  `sender_nabla_healthy = false`          ⇒ never GREEN
+    #[test]
+    fn evaluate_ci_exhaustive_grid_invariants() {
+        const AMOUNT: u64 = 10_000;
+        const LAST_K3: u64 = 1_000_000;
+        fn rank(s: CIStatus) -> u8 {
+            match s { CIStatus::Green => 0, CIStatus::Yellow => 1, CIStatus::Red => 2 }
+        }
+
+        // One representative elapsed per staleness band (0 = Fresh; each
+        // band constant is the inclusive lower edge of the next band).
+        let elapsed_grid = [0, STALENESS_FRESH_SECS, STALENESS_WARM_SECS, STALENESS_STALE_SECS];
+        // One balance per stakes level vs AMOUNT: 20x / 5x / 1.5x / 0.5x.
+        let balance_grid = [200_000u64, 50_000, 15_000, 5_000];
+        let tx_count_grid = [0u64, 2, 10, 20];          // None / Low / Medium / High
+        let ecosystem_grid = [0u8, 1, 3];               // Unknown / Shallow / Deep
+        let mean_grid = [0u64, 3_000, 10_000];          // no-history / anomalous / typical
+
+        let mut states = 0u64;
+        for &elapsed in &elapsed_grid {
+            let now = LAST_K3 + elapsed;
+            for &k3_balance in &balance_grid {
+                for &tx_count in &tx_count_grid {
+                    for &eco in &ecosystem_grid {
+                        for &mean in &mean_grid {
+                            for &scar in &[false, true] {
+                                for &any_k3 in &[false, true] {
+                                    for &conflicts in &[0u64, 1] {
+                                        for &live in &[None, Some(now)] {
+                                            let ci = ConfidenceIndex {
+                                                wallet_pk: vec![1u8; 32],
+                                                last_k3_at: LAST_K3,
+                                                ark_tx_count_since_k3: tx_count,
+                                                k3_balance,
+                                                ark_tx_mean_amount: mean,
+                                                ark_validator_count: eco,
+                                                has_fact_scar: scar,
+                                                has_any_k3: any_k3,
+                                                conflict_count: conflicts,
+                                                validator_signature: vec![],
+                                                issuer_validator_pk: vec![],
+                                            };
+                                            let healthy = evaluate_ci(&ci, now, AMOUNT, live, true);
+                                            let unhealthy = evaluate_ci(&ci, now, AMOUNT, live, false);
+                                            states += 2;
+
+                                            // (i) unconditional overrides ⇒ RED regardless of health
+                                            let underwater = compute_stakes_level(k3_balance, AMOUNT)
+                                                == StakesLevel::Underwater;
+                                            if scar || !any_k3 || underwater {
+                                                assert_eq!(healthy, CIStatus::Red,
+                                                    "override must be RED: scar={scar} any_k3={any_k3} underwater={underwater}");
+                                                assert_eq!(unhealthy, CIStatus::Red);
+                                            }
+
+                                            // (ii) the L clamp: receiver-live ∧ stale ⇒ RED,
+                                            // for BOTH health values (health never rescues L)
+                                            if let Some(t) = live {
+                                                if t - LAST_K3 > L_DELTA_SECS {
+                                                    assert_eq!(healthy, CIStatus::Red,
+                                                        "L clamp must fire: elapsed={elapsed}");
+                                                    assert_eq!(unhealthy, CIStatus::Red,
+                                                        "unhealthy sender must not rescue the L clamp");
+                                                }
+                                            }
+
+                                            // (iii) monotone tighten-only
+                                            assert!(rank(unhealthy) >= rank(healthy),
+                                                "unhealthy scored HIGHER: {unhealthy:?} < {healthy:?} \
+                                                 (elapsed={elapsed} bal={k3_balance} tx={tx_count} eco={eco} \
+                                                  mean={mean} scar={scar} k3={any_k3} conf={conflicts} live={live:?})");
+
+                                            // (iv) unhealthy sender is never GREEN
+                                            assert_ne!(unhealthy, CIStatus::Green,
+                                                "unhealthy sender must never score GREEN");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 4·4·4·3·3·2·2·2·2 grid × 2 health values = 18,432 evaluated states.
+        assert_eq!(states, 18_432, "grid changed — update the expected state count");
     }
 }

@@ -10,9 +10,12 @@
 #  DEV/PROD    `foo` = production value; `foo_dev` = the value used in a
 #              `--features dev-mode` build. build.rs emits ONE constant FOO,
 #              cfg-selected. A key with NO `_dev` twin is identical in both builds.
-#  NOTE        `atoms_per_axc` + `minimum_tx_atoms` are consumed by the
-#              axiom-denomination crate (its build.rs reads this file); Core's
-#              codegen deliberately skips them so they have one owner.
+#  NOTE        `atoms_per_axc` is NOT in this file — the unit ladder is OWNED by
+#              axiom-denomination (denomination/protocol_denomination.toml, the
+#              ONLY file its build.rs reads). Core's codegen skips that key purely
+#              as an anti-drift guard. `minimum_tx_atoms` IS ours (the dust
+#              POLICY, not a unit fact) and emits normally as
+#              protocol_gen::MINIMUM_TX_ATOMS.
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -30,15 +33,275 @@ deed_read_fee  = 100     # per Nabla query
 #  (not in the denomination register). Exposed as MINIMUM_TX_ATOMS.
 minimum_tx_atoms = 500_000   # 0.00005 AXC
 
+# ── FOB (Fixed Outflow Balance / Bounded Pools) — the tranche ECONOMICS ──────
+# Core-OWNED and Core-verified (docs/AXIOM_DESIGN_BoundedPools.md §4, per the
+# 2026-08-09 ruling): the tranche MOVES VALUE, so its amount is computed here
+# and every Nabla's Core re-verifies it (RULE 5 — a Nabla-only tranche fails
+# open). The INFRASTRUCTURE params (epoch length, mover eligibility floor,
+# sortition grace) live in protocol_nabla.toml — Nabla owns the carrier + the
+# committee, Core owns the money. Boot guard (compute::fob_assert_boot_guard):
+# fob_tranche_bps/10_000 * fob_dust_cutoff_atoms >= fob_tranche_min_atoms >=
+# minimum_tx_atoms.
+fob_tranche_bps       = 3_000          # 30% of the accumulator (rule 1), basis points (÷ FEE_BPS_DIVISOR=10_000)
+fob_dust_cutoff_atoms = 10_000_000_000 # rule-2 boundary = 1 AXC: below it, sweep the whole accumulator
+fob_tranche_min_atoms = 500_000        # rule-3 spendable floor (== minimum_tx_atoms); the wedge guard
+# §5 mover ELIGIBILITY floor (% of NBC baseline network a mover must see to AUTHOR
+# a tranche). Core-OWNED, not infrastructure: eligibility gates who may originate a
+# value movement, so every Nabla's Core must apply the SAME floor (RULE 5) — else a
+# patched Nabla weakens it and honest nodes disagree on which tranches are valid.
+# Compared in compute::fob_mover_eligible (fails CLOSED on baseline==0, UNLIKE the
+# oods_healthy wash-out gate). MUST be > 50: a strict majority makes at most one
+# disjoint eligible majority exist ⇒ the epoch's tranche cannot be double-authored.
+fob_mover_oods_floor_pct = 70          # §5 mover eligibility, % of NBC baseline — MUST be > 50
+
 # ── Genesis & authority ────────────────────────────────────────────────────
 #  lockup_seconds: genesis-validator wallets (listed in genesis_lockup_wallets.txt)
 #  cannot SEND until GENESIS_NEWS_ANCHOR + this many seconds. Empty list = off (dev).
-#  owner_proof_required_epoch: TXs with epoch >= this require auth_hash. 0 = always.
-lockup_seconds             = 94_608_000   # 3 years (3 * 365 * 86400)
-owner_proof_required_epoch = 0
+#  (`owner_proof_required_epoch` DELETED 2026-09-25 with `owner_proof`, KI#108.)
+lockup_seconds             = 94_608_000   # 3 years (3 * 365 * 86400) — Tier 1 / Genesis
+
+#  Stake lockups are TIER-PROPORTIONAL: the larger the subsidised stake, the
+#  longer it is committed. Bigger stake = more influence = longer skin in the
+#  game, so an actor cannot take the largest grant and exit first.
+#      Tier 1 Genesis    1,000,000 AXC -> 3 years  (lockup_seconds above)
+#      Tier 2 Foundation   500,000 AXC -> 2 years
+#      Tier 3 Community        500 AXC -> 1 year
+#  All three run from GENESIS_NEWS_ANCHOR for genesis wallets; for validators
+#  admitted later the clock runs from the stake grant. See
+#  AXIOM_DESIGN_ValidatorJoin.md §6a.
+#  Both halves are enforced, in different layers, and the split IS the design:
+#    WALL CLOCK (these registers) — LAMBDA, against its own clock. **Core never
+#      checks it**: Core has no clock, and `tx.epoch` is client-chosen, so a
+#      Core-side comparison is theatre. Anything reading as a wall-clock check
+#      inside Core is a ghost.
+#    TICK (`*_stake_lock_ticks` below) — CORE, against the attested Nabla tick.
+#      This is the half that GRANTS release, and it is always the later of the
+#      two by design.
+#  Deployed enforcement is TWO points, not four: Nabla re-checks NEITHER half
+#  (KI#132 — an open request, not a defect). The client's own wall-clock check
+#  is UX only. Ledger: AXIOM_DESIGN_ValidatorJoin.md §7 row 10.
+tier2_lockup_seconds       = 63_072_000   # 2 years (2 * 365 * 86400) — Foundation
+tier3_lockup_seconds       = 31_536_000   # 1 year  (1 * 365 * 86400) — Community
+
+#  DEV TWINS — see the block at `*_stake_lock_ticks_dev` for why these exist and
+#  why the dev ratio deliberately differs from production's. These must stay
+#  BELOW their tick twin's projection (tick x 5s) so dev reproduces production's
+#  ordering: the wall clock expires FIRST, the tick governs release.
+#    tier3: 120s floor vs ~300s tick   ·   tier2: 240s floor vs ~600s tick
+lockup_seconds_dev         = 600          #   genesis: 10 min (vs ~20 min tick)
+tier2_lockup_seconds_dev   = 240
+tier3_lockup_seconds_dev   = 120
+
+#  ── Stake claim HIBERNATION windows (AXIOM_DESIGN_ValidatorJoin.md §5.2.2c) ─
+#  Tick EVENT COUNTS, not spans — hence `_ticks`, per the KI#131 naming rule at
+#  the VBC block below.
+#
+#  ⚠ CORRECTED 2026-09-05. This block described a DUAL GATE releasing only when
+#  BOTH a tick deadline and the `*_lockup_seconds` wall clock had elapsed. There
+#  is no tick deadline any more: the `stake_locked_until_tick` FIELD was deleted
+#  (a lock is a general "cannot send before T", not a stake-specific pair), and
+#  these counts now feed the HIBERNATION window on the shared HAL/RECALL path —
+#  `hibernation_until_for` selects one by TxKind exactly as it selects HAL's
+#  18,000 and RECALL's 720. The wall-clock half is `wall_clock_lock`, stamped at
+#  the claim's redeem from `*_lockup_seconds`.
+#
+#  These counts stay load-bearing for a second reason: the claim's time
+#  cross-check RECOVERS the claimant's declared epoch by subtracting this window
+#  from the k-attested `hibernation_until`. Change a value and that recovery
+#  changes with it — which is correct, since both sides read the same register.
+#  At nominal 5s cadence 6.5M ticks ~ 1.03y, 13M ticks ~ 2.06y and 20M ticks
+#  ~ 3.17y, so the tick half normally governs. Do NOT "align" these to the
+#  seconds registers.
+#
+#  ⚠ THESE TWO ARE NOT RANKABLE. A tick count is a VECTOR; `*_lockup_seconds`
+#  is a wall-clock UNIT. Do not divide one by the other, do not derive a
+#  crossover cadence, do not call any tier "the narrow one" — two such
+#  attempts were struck here on 2026-09-06. See
+#  [[feedback_tick_is_vector_wallclock_is_unit]].
+#
+#  The lock is an AND of two INDEPENDENT conditions: `hibernation_until` (the
+#  tick deadline, enforced by CORE, and ALWAYS the later of the two by design)
+#  grants release; `wall_clock_lock` (enforced by LAMBDA) can only refuse an
+#  early one. Their distance is a per-tier CONSTANT — `window_secs −
+#  lockup_seconds` — and that constant is the interlock that makes a forged
+#  deadline detectable. Do NOT "align" these registers: the gap is the
+#  mechanism, not slack.
+#  ✅ BUILT + PROVEN LIVE 2026-09-07 (CoreID 34f331d3): Core RUNS the interlock
+#  (`types::stake_lock_pair_is_mintable`, KI#137) with its OWN fixed tolerance
+#  register `stake_lock_interlock_tolerance_secs` (24h; floor-bound at
+#  >= stake_lock_time_range_secs, or it convicts honest wallets).
+#  ⚠ Nabla's re-check is OBSERVE-ONLY (KI#132): it COUNTS
+#  (`stake_lock_observed_not_own_claim` on /status), it does not refuse. A
+#  refusal was built and withdrawn — the claim's own redeem STAMPS the lock, so
+#  refusing "a locked wallet may not register" refused the registration that
+#  CREATES it, scarred the chain and killed the release send. Non-zero on that
+#  counter means a CORE gate leaked.
+#
+#  A nominal `ticks_to_secs` projection is fine for SIZING a dev twin, and for
+#  reconstructing a stamped value (stamper and verifier read the same
+#  register). It is never evidence about which deadline arrives first.
+#
+#  Every tier runs the SAME implementation — one path, `hibernation_until_for`
+#  selecting a count by TxKind. There is no per-tier branch and must not be.
+
+genesis_stake_lock_ticks   = 20_000_000   # Tier 1 Genesis    (~3.17y nominal)
+tier2_stake_lock_ticks     = 13_000_000   # Tier 2 Foundation (~2.06y nominal)
+tier3_stake_lock_ticks     =  6_500_000   # Tier 3 Community  (~1.03y nominal)
+
+#  ── DEV TWINS — WITHOUT THESE, RELEASE IS UNTESTABLE BY CONSTRUCTION ──────
+#  A production lock runs 1-3 YEARS, so no test and no soak can ever observe a
+#  release. These twins make the window MINUTES. Same precedent and same
+#  mechanism as `hibernation_window_dev` (18,000 -> 50): build.rs pairs a
+#  lowercase `<key>_dev` against the verbatim key, so the names below MUST stay
+#  lowercase — nabla's UPPERCASE register style can never pair, and the twin
+#  then emits as a separate DEAD constant while production values silently leak
+#  into dev (the KI#47 failure, which shipped a real 48h oracle maturity).
+#
+#  ⚠ THE DEV RATIO IS DELIBERATELY *NOT* PRODUCTION'S. Production's tick half
+#  clears its wall-clock floor by only ~3% (the crossover note above), which at
+#  dev scale would be a ~9-SECOND gap between the two halves expiring — far too
+#  tight to land a witness round inside. These twins widen it on purpose, so
+#  the interval that matters is easy to hit: the stretch where the WALL CLOCK
+#  HAS PASSED and the tick has NOT, i.e. where Core must still refuse. That is
+#  the regime the release rule rests on, so dev must make it reachable rather
+#  than faithful to the production ratio.
+#
+#  At 5s/tick: tier3 releases at ~300s (tick) against a ~120s wall-clock floor;
+#  tier2 at ~600s against ~240s. Genesis keeps a twin for symmetry so a
+#  ceremony wallet is not accidentally locked for 3 real years in dev.
+genesis_stake_lock_ticks_dev = 240        #   ~20 min @ 5s/tick
+tier2_stake_lock_ticks_dev   = 120        #   ~10 min
+tier3_stake_lock_ticks_dev   =  60        #   ~5 min
+
+#  ── §5.2.2c claim time cross-check ────────────────────────────────────────
+#  How far the CLAIMANT's declared `tx.epoch` and the ISSUERS' `created_at` may
+#  disagree about the claim's own witness round. Sized for clock skew between
+#  honest machines, NOT as a security parameter: an undetectable lie is bounded
+#  BY this value (<=1h shaved off a ~65,000,000s lock), so 24h would serve
+#  equally. Do NOT tighten it believing that strengthens the control — it only
+#  rejects honest validators whose clocks drift. See AXIOM_DESIGN_ValidatorJoin
+#  "Why a wall clock is admissible HERE".
+stake_lock_time_range_secs = 3_600        # 1 hour
+
+#  ── §5.2.2c INTERLOCK TOLERANCE (KI#137) ──────────────────────────────────
+#  How far a wallet's (hibernation_until - wall_clock_lock) distance may sit
+#  from its tier's constant before Core calls the PAIR FORGED.
+#
+#  ⚠ ITS OWN REGISTER, FIXED, AND DELIBERATELY GENEROUS (the owner, 2026-09-06).
+#  The first implementation DERIVED this from `stake_lock_time_range_secs`,
+#  because that is where the deviation mathematically comes from (the stamp
+#  bounds |claimant_epoch - issuer_time| by it). That was wrong as ENGINEERING:
+#  it couples two registers that exist for different reasons, so tightening the
+#  CLAIM-time clock check would silently tighten the interlock and start
+#  convicting wallets minted under the old value. A forgery check must not move
+#  when an unrelated register moves.
+#
+#  ⚠ THIS IS A FLOOR-BOUND VALUE, NOT A FREE CHOICE. It must stay >=
+#  `stake_lock_time_range_secs`: a claimant and issuer legitimately that far
+#  apart shift the distance by that much, so a smaller tolerance convicts HONEST
+#  wallets. Asserted by `interlock_tolerance_cannot_convict_an_honest_pair`.
+#
+#  24h against tier distances of 964,000s / 1,928,000s / 5,392,000s is ~9% of
+#  the narrowest and leaves the tier bands ~964,000s apart — no overlap, so a
+#  forged pair still has to land on a real tier's constant.
+stake_lock_interlock_tolerance_secs = 86_400   # 24 hours
+#  DEV TWIN — REQUIRED, not cosmetic. The dev lock window is MINUTES, and a
+#  tolerance of 1h against a 600s window makes the control VACUOUS: a claimant
+#  could backdate by the entire window and still land inside the range. Caught
+#  by `backdated_claimant_is_caught` the moment the tick twins were added, which
+#  is the test doing its job. Keep this well BELOW the shortest dev window
+#  (tier3 = 60 ticks = 300s).
+#
+#  ⚠ AND IT MUST EXCEED A REAL WITNESS ROUND — 30 was too small and refused an
+#  HONEST claim. MEASURED on the live mesh 2026-09-06: the claimant's epoch was
+#  1788633593 and the three issuers stamped created_at at +18s, +32s and +47s.
+#  Core takes the MAX across the k cheques (deliberately — see §5.2.2c), so the
+#  gap IS the full round duration, ~47s. 150 gives ~3x headroom on that
+#  measurement. Production's 3,600s was never at risk; only the dev twin was.
+stake_lock_time_range_secs_dev = 150
+#  ⚠ The dev twin CANNOT be scaled down like the others. It must stay >= the
+#  dev claim-time range (150), and the dev tier distances are only 180/360/600 —
+#  so the accepted bands OVERLAP and a dev interlock convicts only GROSS
+#  forgeries (a 1s distance, a distance in the thousands, hib < wcl). That is a
+#  consequence of shrinking year-long windows to minutes, not a design choice.
+#  Do NOT read a green dev run as evidence the production interlock is tight;
+#  it is, and this one is a smoke test.
+stake_lock_interlock_tolerance_secs_dev = 150
+
+
+# ── VBC lifecycle windows (AXIOM_DESIGN_ValidatorJoin.md §5.2) ─────────────
+#  ⚠ ALL THREE ARE VALUE SPANS (seconds), per YPX-003 §1.3.3a. They are
+#  compared against `expires_at - tick`, which is also a value span, so no
+#  conversion happens anywhere. They are NOT tick EVENT counts; those differ
+#  by TICK_INTERVAL_SECS (5x). Every register here is named by its unit —
+#  a bare `_TICKS` is how the oracle's documented 24h became 4.8h (KI#131).
+#
+#  Time comes from an ATTESTED TARDIS tick, never SystemTime. A tick is a
+#  witnessed artifact — legitimate only with >= 2 downstream approvals — so a
+#  validator cannot invent one to renew a cert it has let lapse. Enforcing an
+#  additional tick-EVENT bound is deferred: KI#130.
+#
+#  ORDERING IS LOAD-BEARING:
+#      renewal_window > unusable_remaining > provisional_expiry
+#  Raise unusable above renewal and every validator goes dark with no way to
+#  renew. Asserted by `vbc_lifecycle_windows_are_ordered`, so a bad edit fails
+#  the build rather than the fleet.
+vbc_unusable_remaining_secs = 86_400      # 24h — below this a VBC cannot serve
+vbc_renewal_window_secs     = 604_800     # 7d  — below this renewal is permitted
+provisional_vbc_expiry_secs = 43_200      # 12h — born unusable, by design
+
+# KI#130 — the SERVING "loses usefulness N ticks before expiry" window used by
+# `verify_vbc_expiry` on the serving validator's OWN cert, judged DIRECTLY against
+# the ATTESTED tick VALUE (the owner: "tick is tick, don't compare with sec" — the tick
+# VALUE and `expires_at` are the same unit, compared without conversion). COMPILE-TIME
+# dev-tuning pair (build.rs → #[cfg(feature="dev-mode")]): a real ELF gets 1000, a
+# dev-tuning ELF gets 10000 so a cert goes unusable fast under test. This is NOT the
+# runtime is_dev_wallet / dev_or_real mechanism.
+vbc_unusable_remaining_ticks     = 1_000  # REAL — N ticks before expiry the serving cert stops serving
+vbc_unusable_remaining_ticks_dev = 10_000 # DEV — larger window so it fires quickly under test
+
+# KI#130 Gap B — carrier/email-latency tolerance for the OODS freshness gate, in
+# TICKS. `verify_vbc_expiry` rejects a round whose attested OODS tick is staler than
+# the wallet's LAST round's OODS tick by MORE than this buffer (a replay of an old
+# reading); a lag within the buffer is normal carrier delivery time. No upper bound —
+# an idle wallet legitimately has a much newer tick. No dev twin.
+vbc_oods_freshness_buffer_ticks = 20
+
+# KI#130 — max lifetime of a NON-genesis validator VBC, in tick VALUE units,
+# enforced at CL8 issuance (`expires_at - issued_at`). CL8 only ever issues
+# non-genesis certs — the genesis ceremony signs its 10-year certs DIRECTLY
+# (genesis_ceremony.rs), never through CL8 — so no genesis exemption is needed.
+# `expires_at` is requester-supplied (antie/src/gateway.rs), so without this cap an
+# operator could mint a cert of any lifetime. COMPILE-TIME dev-tuning pair:
+# MUST stay > vbc_unusable_remaining_ticks (a cert needs usable life before it goes
+# unusable) — guarded by a compile-time assertion.
+vbc_validity_ticks     = 15_768_000  # REAL — ~6 months (182.5 days)
+vbc_validity_ticks_dev = 50_000      # DEV — short so expiry/renewal is reachable in a test (> the 10_000 dev unusable window)
+
+# ── §5.2.2e PULSE CANDIDACY (the owner, 2026-09-08) — a PROVISIONAL request must
+#  carry the candidate own YPX-009 Pulse proof, verified by CL8.
+pulse_candidacy_min_argon2id_per_sec = 0  # 0 = "ran the audit chain at all" (ruled: measure, then set)
+pulse_candidacy_max_epoch_age        = 2  # proof may lag the request by this many pulse epochs (720 ticks each)
+pulse_candidacy_min_entries          = 64 # a self-audit must chain at least this many entries (64 × 32 MB Argon2id — the sybil cost)
+pulse_candidacy_tick_slack           = 720 # part iii (KI#142): the proof's seed tick must sit within this many ticks of the round's Nabla-attested tick (one Pulse epoch)
+
+# ── §5.3 GENESIS LINEAGE — the ISSUING bar (the owner, 2026-09-04) ──────────────
+# How much life an issuer's OWN certificate must have left before it may admit
+# a new validator.
+#
+# ⚠ DELIBERATELY SEPARATE FROM `vbc_unusable_remaining_secs` (24h, the SERVING
+# bar). They answer different questions — "may you witness a transaction" vs
+# "may you let a new validator into the network" — and sharing a register means
+# tuning one silently moves the other.
+#
+# Remaining life, not age: a validator that has run for two years but expires
+# in three days has no business admitting anyone. Age looks backward, this
+# looks forward.
+vbc_issuing_min_remaining_secs = 604_800  # 7d — below this a VBC cannot ISSUE
 
 # ── DWP (Decentralized Wallet Protection) ──────────────────────────────────
 max_votes_per_case_per_tick = 1   # anti-grief: one vote per sender/case/tick
+max_unresolved_scars = 20   # per-wallet cap on unresolved (unconfirmed, unburned) FACT links
 
 # ── Tick unit (TARDIS) ─────────────────────────────────────────────────────
 #  The base second-count per tick that every window below projects through.
@@ -58,8 +321,32 @@ recall_hibernation_window_dev = 20
 #  window (recall opens only after it); HIGH = when the affordance closes.
 recall_init_window_low      = 18_000
 recall_init_window_low_dev  = 10
-recall_init_window_high     = 50_000
+recall_init_window_high     = 50_000   # TOO_LATE — after this a recall is IMPOSSIBLE
 recall_init_window_high_dev = 100_000
+
+#  ── Cheque CLAIM registers (KI#205, RULED 2026-09-25) — read them WITH the recall windows ──
+#  A redeem MUST carry a Nabla-signed ChequeClaimProof (CL5 Step 3.5b), so the CLAIM is the one
+#  delivery mark the receiver cannot skip; the post-redeem REDEEMED mark can be withheld after the
+#  balance moved (the KI#205 double settle). The claim is authenticated (YPX-022 §2.1.2a) and is
+#  the terminal `register_recall` reads (`CLAIMED`).
+#
+#  ORDER, and who may not exceed whom (asserted at compile time in core/logic/src/types.rs):
+#    recall_hibernation_window (720)      — the recall cheque's maturity AFTER commit; unrelated to
+#                                            the init window, listed so nobody "aligns" it.
+#    cheque_claim_proof_max_age_ticks     < recall_init_window_low      (17_280 < 18_000)
+#        CL5 FRESHNESS of the proof only: a proof older than this is refused at redeem (re-claim).
+#        It is DELIBERATELY shorter than the recall opening, so it is NOT what blocks a recall —
+#        if it were, a patient receiver would wait it out (that was the hole).
+#    recall_init_window_low               < recall_init_window_high    (18_000 < 50_000)
+#    CLAIM HOLD for the recall gate        = recall_init_window_high    (NO separate register:
+#        Nabla evicts a claim at exactly TOO_LATE, when a recall can no longer be initiated — a
+#        claim must never outlive the window it guards, and never become a permanent record).
+#  DEV twins: the claim freshness has NO dev twin (stays 17_280) while recall opens at 10 on a
+#  dev fleet, so in DEV the freshness bound outlives the recall opening (17_280 > 10) — the
+#  opposite of PROD. That inversion is why the KI#205 gate passed in dev via the SDK's query-txid
+#  enquiry while prod would not; a gate proving this ruling must bypass the enquiry and ask
+#  `register_recall` directly.
+cheque_claim_proof_max_age_ticks = 17_280   # ~24h — CL5 Step 3.5b (was the hardcoded CHEQUE_CLAIM_PROOF_EXPIRY_TICKS)
 
 #  Dev-WALLET override (standalone keys, no `_dev` twin → same in dev AND prod):
 #  an @axiom.internal wallet gets these SHORT windows even in a prod build, so
@@ -72,17 +359,229 @@ dev_wallet_recall_hibernation_window = 60
 # ── Oracle distribution (YPX-012) ──────────────────────────────────────────
 #  Long-horizon (24–48h); candidates for a future `_dev` short variant.
 claim_interval_ticks     = 17_280   # ~24h @ 5s/tick
+claim_interval_ticks_dev = 12   # dev ~1m — rate-limit reject/accept is testable
 oracle_maturity_ticks    = 34_560   # ~48h
-oracle_vbc_renewal_ticks = 17_280   # ~24h
+oracle_maturity_ticks_dev = 20   # dev ~1m40s — gate waits it out then redeems
+oracle_vbc_renewal_secs = 86_400   # 24h (KI#131: compared as a SECOND span — must be seconds, not a tick count; the 17_280 tick-count value enforced 4.8h)
 
 # ── Audit — peer-audit + pulse-audit (mixed ticks / seconds) ───────────────
-audit_trigger_rate          = 100      # ~1 in 100 TXs triggers an audit
-peer_audit_timeout_secs     = 600      # 10 min
-peer_audit_ban_ticks        = 17_280   # ~24h
-peer_audit_crash_delay_secs = 180      # 3 min
-pulse_audit_interval_secs   = 300      # 5 min
+audit_trigger_rate          = 50       # ~1 in 50 TXs triggers an audit (volume trigger; was 100 — the owner 2026-09-26 "1 in 50 should be enough"). Now in EVERY Core, dev included.
+peer_audit_timeout_ticks    = 600      # 10 min. ⚠ UNIT: a difference of ATTESTED tick VALUEs
+#   (unix-second stamps, Core time not SystemTime) compared DIRECTLY — the "_ticks" suffix flags
+#   Core-tick-sourced, NOT a tick-COUNT needing ×TICK_INTERVAL_SECS. Same convention as VBC expiry
+#   (vbc.rs "tick is tick") + the time-bond below. 600 tick-VALUE units = 600 s = 10 min. Was the
+#   wall-clock `_secs` gate at interpreter.rs (tick-discipline fix, [[feedback_no_wallclock_only_core_time]]).
+peer_audit_ban_ticks        = 17_280   # ~24h — ⚠ DIFFERENT unit: a tick COUNT, projected ×TICK_INTERVAL_SECS by ban_window_stamp() (judged vs the tx.epoch watermark, not the attested tick)
+peer_audit_ban_ticks_dev    = 720      # DEV (dev-mode build) — ~1h (720 × 5 s), so a soak can watch a ban LIFT (the owner 2026-09-26). Same unit: tick COUNT.
+# peer_audit_crash_delay_secs REMOVED 2026-09-21 — its only consumer was the process::exit self-crash
+#   deleted with KI#207 raw-fields (fac3bb33); a const nobody reads is a ghost (RULE 3).
+pulse_audit_interval_secs   = 300      # 5 min — ⚠ still wall-clock (pulse self-audit trigger); separate debt
+# migrated from types.rs hard-codes 2026-09-21 (values identical → CoreID-neutral):
+audit_countdown_txs         = 10       # self-audit: Lambda has this many TXs to comply
+peer_audit_countdown_txs    = 100      # peer-audit: TXs to comply (email round-trip budget)
+pulse_audit_deadline_ticks  = 60       # ~300s to respond to a pulse audit
+# ── Peer-audit TIME-BOND (§23.14.1 cadence, YP §23.14.1) ───────────────────
+#  The volume trigger (audit_trigger_rate, 1-in-50) never fires for a
+#  low-traffic validator. This bonds the peer audit to TICKS instead: on the
+#  first eligible witnessed Accept once the ATTESTED tick (oods, not tx.epoch —
+#  a client cannot hold it back) has advanced past this many ticks since the
+#  last peer-audit demand, Core's AVM host fires one. Evaluated only ON a tx →
+#  no tx = silent. Host-side (like the countdown / pulse trigger), so it carries
+#  the same tamper model, NOT the ELF/CoreID tamper-evidence the volume trigger
+#  has. TICKS only [[feedback_no_wallclock_only_core_time]].
+#  ⚠ UNIT: tick-VALUE units (unix-second stamps), compared DIRECTLY against the attested-tick
+#  difference — "tick is tick", same as VBC expiry (vbc.rs), NOT a tick-COUNT (do NOT wrap in
+#  ticks_to_secs). So 17_000 ≈ 17_000 s ≈ 4.7 h between forced audits of a low-volume validator.
+audit_max_tick_gap          = 17_000   # REAL — ~4.7h (17_000 attested tick-VALUE units / unix-sec)
+audit_max_tick_gap_dev      = 1_800    # DEV — 30 min (was 500): the FLOOR for a quiet validator now that the volume trigger runs in dev too (2026-09-26)
+
+# ── ZKP qualification (YPX-007 §9, KI#125) ─────────────────────────────────
+#  Max gap between the two Nabla readings bracketing the startup STARK, in tick-VALUE
+#  units (unix-seconds; the KI#130 convention). TICK_INTERVAL_SECS = 5 ⇒ 5 = at most ONE
+#  TARDIS step: a proof under 5 s always passes, 5–10 s passes only if no tick boundary
+#  intervenes, ≥ 10 s never. No dev twin — REAL timing everywhere (KI#240).
+zkq_max_gap_ticks = 5
+
+# ── Transaction Velocity Limit (TVL) — YP §23.15, KI#221 ──────────────────────
+#  A wallet's CONSECUTIVE transactions must be at least this many ticks apart on
+#  the Nabla-attested OODS tick. Closes the sub-tick double-spend burst (redeem a
+#  stale attestation onto two validator sets, then fork two sends before the
+#  conflict-ban gossip converges — KI#221): an honest wallet never moves this fast,
+#  so the floor costs legitimate traffic nothing and denies the attacker the speed
+#  the race needs. Enforced in Core (validation.rs verify_tx_velocity) against the
+#  k-witnessed prev_receipt.oods_flag.tick and this tx's verified oods_attestation
+#  tick — trusted because BOTH are Nabla-signed (verify_oods_attestation); holds
+#  unless every Nabla AND validator on the round colludes (honest-majority, the
+#  same trust every attested-tick gate already assumes — the owner 2026-09-27).
+#  ⚠ UNIT: a tick COUNT (like peer_audit_ban_ticks), projected ×TICK_INTERVAL_SECS
+#  via TickCount::to_secs() before comparison against the tick-VALUE difference.
+#  So 5 ticks ≈ 25 s minimum spacing. It HAS an account-keyed dev twin (below,
+#  the owner 2026-09-27) — the earlier "NO dev twin" wording here was stale (RULE 3
+#  shape 7, corrected 2026-09-28). TVL is a RATE LIMIT only; the Fork Settlement
+#  settle floor is its own register, `scar_settle_ticks` (below), not this one.
+tx_velocity_min_ticks       = 5        # TICK COUNT — ≥5 ticks (~25 s) between a wallet's consecutive txs
+tx_velocity_min_ticks_dev   = 1        # DEV twin (account-keyed, @axiom/@axiom.internal) — 1 tick (~5 s):
+#  SHORTENED, never 0. A sub-tick fork has cur−prev≈0 < 5 s, so even 1 tick still BLOCKS it —
+#  which is exactly what keeps the dev-class fork test (tests/double_spend_fork_test.py, @axiom
+#  wallets) able to PROVE the fix. 0 would exempt our own regression. Selected via dev_or_real on
+#  the k-signed prev_receipt.is_dev_class; check_dev_timing gate requires that path (the owner 2026-09-27).
+
+# ── Settled origin — YPX-001 §1.5.1b, AXIOM_DESIGN_ForkSettlement.md §3.2 / Q1 (KI#221) ──
+#  The SETTLE FLOOR: how long a vouching Nabla node must have HELD an origin's
+#  registration (uncontested, while listening) before its txid attestation can clear
+#  an inherited scar — `fact::origin_settled_link` / `origin_settled_cl5` require
+#  `att.nabla_tick >= att.sender_registered_at_tick + floor.to_secs()`. Both ticks are
+#  the SAME node's wall-clock `virtual_secs` (first-seen and signing), so no inter-node
+#  skew enters; the floor is a DURATION measured on the node's OWN wall clock.
+#  Sizing (Q1, pass 4): flood max 20 s + record-AE convergence ≈ log2(N)+2 rounds of
+#  30 s ≈ 180 s at N=10 → 200 s. To be MEASURED on the fleet (widespread-shed shape,
+#  bloom-mode N0) before the rotation.
+#  ⚠ UNIT: a tick COUNT, projected via TickCount::to_secs() — never compared raw.
+scar_settle_ticks           = 40       # TICK COUNT — 40 ticks (~200 s) settle floor (ForkSettlement Q1)
+scar_settle_ticks_dev       = 8        # DEV twin (account-keyed, @axiom/@axiom.internal) — 8 ticks (~40 s):
+#  SHORTENED, never 0 (0 would let a dev-class fork receiver clear at once and exempt the
+#  fork gate from its own control). Selected via dev_or_real on the k-signed is_dev_class
+#  (the link's own flag, or the CL5 bundle class); check_dev_timing requires that path.
 
 # ── Ark CI staleness bands (YPX-010) ───────────────────────────────────────
 staleness_fresh_secs = 1_800    # 30 min
 staleness_warm_secs  = 18_000   # 5 h
 staleness_stale_secs = 43_200   # 12 h
+
+# ── FACT chain depth & compression (SEC-07 travel model) ───────────────────
+#  Two questions only, and each has exactly ONE number here:
+#     (a) WHEN does a chain compress?   -> propose / finalize / keep, below
+#     (b) HOW DEEP is too deep?         -> fact_hard_ceiling (protocol backstop)
+#                                          + operator max_fact_links
+#                                            (lambda/protocol_lambda.toml)
+#  Nothing else bounds depth. If you find a third figure, it is stale —
+#  `fact_compress_trigger` (5) was exactly that and was deleted 2026-08-18 after
+#  it spent months unread while a wrong error message pointed people at it.
+#
+#  A chain LEGITIMATELY sits above the compression trigger: a checkpoint is a
+#  PROPOSAL that travels, gaining ~1 distinct co-sign per TX (S-ABR overlap), so
+#  depth climbs to roughly 6-12 before it has enough signatures to finalize and
+#  drain. Depth is a START SIGNAL, never a deadline.
+#
+#  ⚠ Do NOT raise a bound to make a depth rejection disappear. A chain at the
+#  ceiling is reporting that its checkpoint STOPPED FINALIZING; widening the
+#  bound hides the signal and costs every validator CPU (a link is ~80KB, so the
+#  ceiling sets worst-case CBOR verified per TX). See RULE 2.
+
+# (a) WHEN — checkpoint lifecycle.
+fact_propose_trigger     = 4    # total links at which the FIRST validator writes
+                                #   the checkpoint proposal (a start signal)
+checkpoint_sig_threshold = 3    # DISTINCT validator co-signs to FINALIZE (delete
+                                #   covered links). = min_fact_witnesses (k=3),
+                                #   GLOBAL not per-k: after the covered links are
+                                #   deleted a verifier cannot re-check a per-k
+                                #   threshold, so per-k is forgeable downward.
+fact_keep                = 3    # live tail retained after a checkpoint finalizes
+
+# (b) HOW DEEP — the protocol backstop.
+#  Counts RESOLVED links only (nabla_confirmation | burn_proof | recall_proof);
+#  scarred links do not count here. This is the anti-abuse bound that stops a
+#  pathological non-converging chain growing forever when an operator sets
+#  max_fact_links too high (or to 0 = disabled).
+#  BURN is exempt from it — see max_burns_per_heal_basis.
+fact_hard_ceiling        = 32
+
+#  Basis for the SDK's burn-per-call cap (`MAX_BURNS_PER_HEAL_CALL = this + 1`,
+#  sdk/client/src/heal.rs). NOT a depth gate — it gates nothing on the validation
+#  path, and believing otherwise cost a full misdiagnosis on 2026-08-18. It sizes
+#  how many scars one heal call may burn, so a wallet at the operator gate can
+#  still drain its scars in a single call. Keep it at/below max_fact_links.
+max_fact_depth           = 8
+
+# ══════════════════════════════════════════════════════════════════════════
+#  GENESIS DISTRIBUTION — THE WHOLE SUPPLY, ONE TABLE
+# ══════════════════════════════════════════════════════════════════════════
+#
+#  Every row of the genesis allocation, in WHOLE AXC. This IS the distribution:
+#  `genesis_integrity::build_genesis_fact` declares the sub-pools from these
+#  numbers, so the table and FACT #0 cannot disagree.
+#
+#  ⚠ THE BUILD REFUSES TO PROCEED unless these rows sum to EXACTLY
+#  `genesis_supply_total_axc`. Not a test, not a preflight step — `build.rs`
+#  panics, so a distribution that does not add up cannot be compiled, let
+#  alone deployed. Edit a row and the next build tells you what it now sums to.
+#
+#  ⚠ AND THE TWO SUBSIDY POOLS ARE DERIVED, NOT TYPED. Each must equal
+#  slots x CLAIM amount, and the build checks that too. They were literals in
+#  three places (this file, the genesis fact, and the Rust tier constants)
+#  until 2026-09-04; changing the claim payout meant three edits in lockstep
+#  and one of them was missed — Nabla matched a claim at 505 while debiting
+#  the pool 500, i.e. Core minting money the pool never paid. Derived values
+#  cannot drift.
+#
+#  Changing ANY number here changes the genesis fact hash, and therefore the
+#  CoreID. It is a fresh-genesis change, never a retain.
+
+genesis_supply_total_axc      = 100_000_000  # the whole supply; rows must sum to this
+
+#  ── The subsidy pools: slots x claim, checked by build.rs ──
+#  A claim pays the stake floor PLUS a fee allowance, because the witness fee
+#  comes out of the amount in transit: funding a candidate exactly its floor
+#  landed it BELOW that floor and unable to join (measured 2026-09-04). The
+#  allowance is 1% in both tiers and the surplus is the new validator's
+#  working balance.
+#
+#  ⚠ THE ALLOWANCE IS SIZED FOR k=3 BECAUSE CORE PINS THE CLAIM TO k=3 —
+#  KI#152, RULED (b) 2026-09-13 (the owner). The fee is 30 bps PER VALIDATOR at the
+#  cap and the aggregate scales with the receiver's tier (k x 30 bps), so a
+#  claim to a Secure (k=4) or AAA (k=5) address would have paid 4-5 slots and
+#  landed below the floor. Instead of sizing the allowance for K_MAX (the
+#  2026-09-12 alternative, 508 / 508,000, merged then reverted — it moved five
+#  registers and the White Paper line to guard a path no shipped client builds),
+#  `validation.rs` REFUSES a stake claim whose receiver is not the claimant's
+#  Standard-tier address (E_STAKE_CLAIM_TIER_INVALID, code 1011) and the SDK
+#  will not build one. At k=3 and the cap: 505 -> 500.45, floor cleared, every
+#  witness paid in full. `types.rs::_CLAIM_SURVIVES_WORST_CASE_WITNESS_FEE`
+#  asserts exactly that at compile time. Do not hand-tune either number: both
+#  pools below are DERIVED from them and build.rs re-checks the sum.
+#
+#  ⚠ RULED 2026-09-13 (the owner) — numbers and reasoning: docs/AXIOM_REF_BootstrapEconomics.md.
+#  ONE stake floor for every validator (no Genesis floor, no Foundation floor); the
+#  Genesis grant is a ceremony opening balance, not a floor; the Foundation claim is
+#  a sized STIMULUS (target landed 6,000), not a floor plus allowance. Both claims
+#  keep "target + 1 %" so they land at or above their target after the 0.9 % k=3 cap.
+validator_stake_floor_axc     = 500          # the ONE floor (YP §25.5.1); checked at registration + renewal
+genesis_validator_grant_axc   = 1_000_000    # each genesis validator's ceremony opening balance
+foundation_stimulus_landed_axc = 6_000       # what a Foundation claim must land at, after fees
+foundation_subsidised_slots   = 5
+community_subsidised_slots    = 85
+tier2_claim_axc               = 6_060        # Foundation: stimulus 6,000 + 60 allowance (1 %)
+tier3_claim_axc               = 505          # Community: floor 500 + 5 allowance (1 %)
+
+#  ── The table ──
+pool_genesis_axc              = 10_000_000   # the ten genesis validators
+pool_market_axc               = 86_126_775   # enters circulation via market activity
+pool_validator_emission_axc   = 2_000_000    # contribution emission pool — Market carve, ruled 2026-09-14 (AXIOM_DESIGN_ValidatorEmission.md)
+pool_foundation_bootstrap_axc = 30_300       # 5 x 6,060 — DERIVED, checked
+pool_airdrop_axc              = 600_000      # §17.11 public airdrop
+pool_srp_axc                  = 500_000      # staged release
+pool_developer_axc            = 500_000      # developer allocation
+pool_bootstrap_axc            = 42_925       # 85 x 505 — DERIVED, checked
+pool_architecture_axc         = 200_000      # architecture contributors
+
+#  ── Contribution emission (AXIOM_DESIGN_ValidatorEmission.md, YP §25.2.4 v2.21.0) ──
+#  ONE two-way pool (`pool_validator_emission_axc` above) pays validators and
+#  Nabla nodes an equal per-epoch share (last epoch's claim count sets it) and
+#  is topped up from DEED by the shortfall only. Targets are ATOMS per day —
+#  123.3 AXC/day = 90 x 500 / 365 (T = 1 year, ruled); 185 = 123.3 x 30/20.
+#  DEED is perpetual (no 10-year cutoff) and drawable 20 % validators / 30 %
+#  Nabla nodes; the remaining 50 % accumulates for developers (YP §20).
+#  The small-validator lines are RULED (2,000; fee line = the epoch share) but
+#  NOT ENFORCED until Pulse ships — `small_validator_lines_enforced = 0`.
+validator_emission_target_atoms_per_day = 1_233_000_000_000   # 123.3 AXC/day
+nabla_emission_target_atoms_per_day     = 1_850_000_000_000   # 185 AXC/day
+deed_draw_cap_validator_bps   = 2_000        # 20 % of cumulative DEED inflow
+deed_draw_cap_nabla_bps       = 3_000        # 30 %; developers = the remainder (50 %)
+small_validator_max_stake_axc = 2_000        # eligibility line (stake), ruled
+small_validator_lines_enforced = 0           # 0 until Pulse ships; the fee line = the epoch share
+
+#  ── Outside the public supply, declared here so it has ONE home too ──
+#  The dev-AXC treasury is a SEPARATE denomination (FACT class isolation §4):
+#  it funds `@axiom.internal` wallets and is deliberately NOT part of the
+#  100,000,000 public cap, so it is excluded from the sum above.
+pool_dev_treasury_axc         = 1_000_000    # dev-AXC, NOT public supply

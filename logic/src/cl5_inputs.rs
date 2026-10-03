@@ -44,7 +44,7 @@ use alloc::string::{String, ToString};
 
 use crate::types::{
     ChequeBundle, ChequeClaimProof, CoreLogicMode, FeeShare, NablaTxidAttestation,
-    PublicInputs, Transaction, TxKind,
+    PublicInputs, Receipt, Transaction, TxKind,
 };
 
 /// Build the canonical CL5 attestation-context `PublicInputs`.
@@ -57,9 +57,11 @@ use crate::types::{
 ///
 /// `current_balance`, `wallet_seq`, and `state_id` are the receiver's
 /// pre-redeem wallet state, supplied by the client via
-/// `RedeemRequestEnvelope.current_state`. First-time receivers MUST
-/// supply zero-valued fields (state_id=[0u8;32], balance=0, seq=0)
-/// per CLAUDE.md §15 — `None` is no longer a valid encoding.
+/// `RedeemRequestEnvelope.current_state`. A first-time receiver supplies
+/// its OPENING state (seq 0, opening balance, its opening id — what the
+/// SDK's fresh wallet holds — or the zero label; `WalletState::
+/// is_opening_state`) and NO `prev_receipts`; `None` is not a valid
+/// encoding (CLAUDE.md §15).
 ///
 /// `cheque_claim_proof` is the Nabla-writer-signed §4.6 verify
 /// receipt; Core CL5 rejects with `ChequeClaimProofMissing` if
@@ -89,7 +91,37 @@ pub fn build_cl5_attestation_inputs(
     current_balance: u64,
     wallet_seq: u64,
     current_hibernation: u64, // YPX-020 — receiver's current hibernation_until (carried, not zeroed)
+    // §5.2.2c — the receiver's current stake lock. CL5's gate keys on this to
+    // refuse a redeem by a stake-locked wallet (KI#133), so it must be
+    // populated, not `None`.
+    //
+    // ⚠ WRONG READING, corrected 2026-10-01 (Fable review F-1(b); RULE 0 §4).
+    // This said "both sides pass the CLIENT-declared value [here]; the
+    // authoritative copy is the one Lambda passes to the REAL CL5 execution
+    // from its own storage" — a client-declared / Lambda-authoritative split.
+    // Lambda's row is NOT authoritative: a validator that never served the
+    // wallet holds no row (it fed `0`), and one that served it before the lock
+    // / floor was set holds a stale one. The authority is the receiver's LAST
+    // K-SIGNED RECEIPT (`prev_receipts` below): CL5 re-derives these DECLARED
+    // values to its `state_hash` (`modes::cl5_anchor_receiver_state`). So every
+    // caller — the SDK's run, Lambda's recompute AND Lambda's real execution —
+    // passes the DECLARED values; Lambda's row is a pre-check only.
+    current_wall_clock_lock: u64,
+    // §4.2a — the receiver's current `emission_claimed_epoch` (declared,
+    // anchored like the lock above).
+    current_emission_claimed_epoch: u64,
+    // ValidatorJoin §6b.13 — the receiver's current stake floor (CARRIED by the
+    // redeem) and wallet-format block (CL5 refuses a non-current one). Declared,
+    // anchored like the two above.
+    current_stake_floor_until: u64,
+    current_wallet_format: crate::types::WalletFormat,
     state_id: [u8; 32],
+    // Fable review 2026-10-01 F-1(b) — the receiver's last k-signed receipt
+    // (`RedeemRequestEnvelope::prev_receipts`): EXACTLY ONE for a returning
+    // receiver, NONE for a first-time (zero) one. Bound into the attestation
+    // input hash, so a validator is never handed a different receipt than the
+    // one the client attested with.
+    prev_receipts: Vec<Receipt>,
     cheque_claim_proof: Option<ChequeClaimProof>,
     txid_attestation: Option<NablaTxidAttestation>,
     // YPX-021 §8.2 — the client-fetched Nabla OODS reading. BOTH call
@@ -142,7 +174,6 @@ pub fn build_cl5_attestation_inputs(
         nonce: 0,
         reference: String::new(),
         receiver_address: None,
-        owner_proof: None,
         scar_passcode: None,
         burn_target_tx_id: None,
         recall_target_tx_id: None,
@@ -151,24 +182,31 @@ pub fn build_cl5_attestation_inputs(
     };
 
     PublicInputs {
+        zkq_request: None,
+        fact_certificates: alloc::vec::Vec::new(),
         mode: CoreLogicMode::CL5,
         local_core_id,
-        withdrawal_inputs: None,
         transaction: cl5_tx,
         current_state: None,
-        prev_receipts: vec![],
+        prev_receipts,
         vbc_bundle: None,
         cheque_bundle: Some(bundle.clone()),
         receiver_pk: Some(receiver_pk.to_vec()),
         receiver_current_balance: Some(current_balance),
         receiver_wallet_seq: Some(wallet_seq),
         receiver_current_hibernation: Some(current_hibernation),
+        receiver_current_wall_clock_lock: Some(current_wall_clock_lock),
+        receiver_current_emission_claimed_epoch: Some(current_emission_claimed_epoch),
+        receiver_current_stake_floor_until: Some(current_stake_floor_until),
+        receiver_current_wallet_format: Some(current_wallet_format),
         receiver_new_balance: Some(cl5_new_balance),
         receiver_new_state_id: None,
         my_validator_pk: None,
         overlapped_signatures: vec![],
         group_member_index: None,
         sender_fact_chain: None,
+        receiver_witness: None,
+        receiver_signing_key: None,
         // §15-attestation: always None. See parameter-list comment above.
         max_fact_links: None,
         receiver_fact_chain: None,
@@ -179,15 +217,11 @@ pub fn build_cl5_attestation_inputs(
         issuer_sphincs_sk: None,
         cl1_execution_proof: None,
         zkp_nonce: None,
-        scar_heal_tx_id: None,
-        scar_heal_nabla_id: None,
-        scar_heal_root_hash: None,
         audit_confirmation: None,
         nonce_response: None,
         audit_response: None,
         wallet_secret: None,
         fanout_message: None,
-        candidate_balance: None,
         nabla_stake_proof: None,
         frozen_wallets: None,
         console_current_cert: None,
@@ -197,7 +231,9 @@ pub fn build_cl5_attestation_inputs(
         txid_attestation,
         cheque_claim_proof,
         oods_attestation,
-        recall_attestation: None, // CL5 is redeem; RECALL is a CL2 self-send
+        recall_attestation: None,
+        fob_claim_attestation: None,
+        claimant_vbc: None, // CL5 is redeem; RECALL is a CL2 self-send
         clara_attestation: None,
         phase_out_payload: None,
         phase_out_era_end_ticks: vec![],

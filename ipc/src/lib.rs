@@ -94,7 +94,7 @@ pub enum CoreIpcConfig {
     Subprocess {
         /// Path to core-bin binary
         binary_path: PathBuf,
-        /// Extra arguments passed to core-bin (e.g. --vbc, --skip-verify)
+        /// Extra arguments passed to core-bin (e.g. `--vbc <vbc-bundle.cbor>`)
         args: Vec<String>,
     },
     /// TCP mode: connect to running core.bin server
@@ -170,7 +170,7 @@ impl CoreIpcClient {
         Self::new(CoreIpcConfig::Subprocess { binary_path, args: vec![] })
     }
 
-    /// Create subprocess with extra args (e.g. `--vbc <path>`).
+    /// Create subprocess with extra args (e.g. `--vbc <vbc-bundle.cbor>`, ValidatorJoin §6b.12 point 4b).
     pub fn subprocess_with_args(binary_path: PathBuf, args: Vec<String>) -> Self {
         Self::new(CoreIpcConfig::Subprocess { binary_path, args })
     }

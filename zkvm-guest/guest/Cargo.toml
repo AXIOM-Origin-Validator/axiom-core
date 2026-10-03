@@ -18,7 +18,10 @@ axiom-dmap-vm = { path = "../../avm", default-features = false }
 # Core logic — ZKP checkpoint function runs inside guest
 axiom-core-logic = { path = "../../logic", default-features = false }
 
-# BLAKE3 for checkpoint hashes (zkp_nonce_hash, fact_commitment, auth_hash)
+# BLAKE3 — no direct use left in the guest since 2026-09-28 (R35 deleted the
+# hand-copied fact_commitment; zkp_nonce_hash comes from Core's builder). Kept so
+# the guest Cargo.lock does not change without a risc0 rebuild; drop it at the
+# next zkVM guest rebuild.
 blake3 = { version = "1.5", default-features = false }
 
 # Serialization for types
